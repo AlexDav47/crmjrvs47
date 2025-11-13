@@ -1,0 +1,3048 @@
+// 5Yes! Apps Script — телефоны, города (алиасы + fuzzy + кэш + геокодер/ИИ), регионы, владельцы, дедуп
+
+/***** SETTINGS *****/
+const CFG = {
+  SHEET_MASTER: 'Leads (Master)',
+  SHEET_CACHE: 'Cities_Cache',
+  SHEET_ALIASES: 'City_Aliases',
+  SHEET_CITIES_REF: 'Cities_Ref',
+  SHEET_MAP: 'Regions_Map',
+  SHEET_OWNERS: 'Owners',
+  COUNTRY_DEFAULT: 'RU',
+  CONFIDENCE_OK: 0.7,
+  GEOCODER: 'google', // 'google' | others
+};
+
+/***** HOOK *****/
+// ЛЁГКИЙ onEdit — простой триггер (без UrlFetch, без сети)
+function onEdit(e){
+  if (!e || !e.range) return;
+
+  const sh = e.range.getSheet();
+  const sheetName = sh.getName();
+  const row = e.range.getRow();
+
+  // Логика для Master
+  if (sheetName === 'Leads (Master)'){
+    if (row === 1) return; // шапку не трогаем
+
+    const headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
+    const H = Object.fromEntries(headers.map((h,i)=>[String(h).trim(), i+1]));
+
+    try {
+      if (typeof processRow_ === 'function'){
+        processRow_(sh, row, true);
+      }
+    } catch(err){
+      if (typeof logError_ === 'function'){
+        logError_('onEdit/Master', err, {row});
+      }
+    }
+    return;
+  }
+
+  // Логика для листов менеджеров: Leads - Имя
+  if (sheetName.startsWith('Leads - ')){
+    try {
+      syncOwnerSheetEditToMaster_(e);
+    } catch(err){
+      if (typeof logError_ === 'function'){
+        logError_('onEdit/OwnerSheet', err, {sheetName, row});
+      }
+    }
+    return;
+  }
+
+  // остальные листы можно игнорировать или добавить свою логику
+}
+
+// ТЯЖЁЛЫЙ onEditHeavy — будет запускаться installable-триггером, тут можно UrlFetch
+function onEditHeavy(e){
+  if (!e || !e.range) return;
+  const sh = e.source.getActiveSheet();
+  if (sh.getName() !== 'Leads (Master)') return;
+  const row = e.range.getRow();
+  if (row === 1) return;
+  // полный режим с геокодером/UrlFetch
+  processRow_(sh, row, /*safe=*/false);
+}
+
+/***** NIGHTLY *****/
+function nightlyDedupe(){
+  const sh = SpreadsheetApp.getActive().getSheetByName(CFG.SHEET_MASTER);
+  const headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
+  for (let row=2; row<=sh.getLastRow(); row++){
+    dedupeRowFuzzy_(sh, headers, row);
+  }
+}
+
+/** Авто created_at и lead_id при первом редактировании строки */
+function ensureCreatedAndId_(sheet, row, headers){
+  const H = Object.fromEntries(headers.map((h,i)=>[h, i+1]));
+
+  // created_at — ставим только если пусто
+  if (H['created_at'] && !sheet.getRange(row, H['created_at']).getValue()){
+    sheet.getRange(row, H['created_at']).setValue(new Date());
+  }
+
+  // lead_id — ставим только если пусто
+  if (H['lead_id'] && !sheet.getRange(row, H['lead_id']).getValue()){
+    const id = nextLeadId_();
+    sheet.getRange(row, H['lead_id']).setValue(id);
+  }
+}
+
+/** Генератор lead_id с дневной нумерацией: L-YYYYMMDD-0001 */
+function nextLeadId_(){
+  const props = PropertiesService.getScriptProperties();
+  // используем таймзону таблицы (надёжнее)
+  const tz = SpreadsheetApp.getActive().getSpreadsheetTimeZone() || 'Etc/UTC';
+  const today = Utilities.formatDate(new Date(), tz, 'yyyyMMdd');
+
+  const KEY_DAY = 'SEQ_DAY';
+  const KEY_NUM = 'SEQ_NUM';
+
+  const curDay = props.getProperty(KEY_DAY);
+  let n = Number(props.getProperty(KEY_NUM) || '0');
+
+  if (curDay !== today){
+    n = 0;
+    props.setProperty(KEY_DAY, today);
+  }
+
+  n += 1;
+  props.setProperty(KEY_NUM, String(n));
+
+  return 'L-' + today + '-' + ('0000' + n).slice(-4);
+}
+
+/***** PHONE *****/
+function normalizePhone_(raw, defaultCountry='RU'){
+  const onlyDigits = String(raw||'').replace(/\D/g,'');
+  if (!onlyDigits) return {clean:'', e164:'', valid:false, note:'empty'};
+  if (defaultCountry === 'RU') {
+    if (onlyDigits.length === 11 && onlyDigits[0] === '8') {
+      return {clean:onlyDigits, e164:'+7'+onlyDigits.slice(1), valid:true, note:'ru_8_to_7'};
+    }
+    if (onlyDigits.length === 11 && onlyDigits[0] === '7') {
+      return {clean:onlyDigits, e164:'+7'+onlyDigits.slice(1), valid:true, note:'ru_7'};
+    }
+    if (onlyDigits.length === 10) {
+      return {clean:onlyDigits, e164:'+7'+onlyDigits, valid:true, note:'ru_10_to_e164'};
+    }
+  }
+  if (onlyDigits.length >= 10 && onlyDigits.length <= 15) {
+    return {clean:onlyDigits, e164:'+'+onlyDigits, valid:true, note:'intl_guess'};
+  }
+  return {clean:onlyDigits, e164:'', valid:false, note:(onlyDigits.length<10?'too_short':'too_long')};
+}
+
+function phoneTailKey_(cleanDigits, tail=8){
+  const d = String(cleanDigits||'').replace(/\D/g,'');
+  return d.slice(-tail);
+}
+
+/***** CITY NORMALIZATION *****/
+function normalizeRus_(t){
+  return String(t).toLowerCase().replace(/ё/g,'е').replace(/\s+/g,' ').replace(/\s*-\s*/g,'-').trim();
+}
+
+function aliasCity_(s){
+  const sh = SpreadsheetApp.getActive().getSheetByName(CFG.SHEET_ALIASES);
+  if (!sh) return '';
+  const last = sh.getLastRow();
+  if (last < 2) return '';
+  const vals = sh.getRange(2,1,last-1,2).getValues(); // [abbr, canonical]
+  const map = Object.fromEntries(vals.map(([a,c])=>[normalizeRus_(a), c]));
+  return map[s] || '';
+}
+
+function getCitiesRef_(){
+  const sh = SpreadsheetApp.getActive().getSheetByName(CFG.SHEET_CITIES_REF);
+  if (!sh) return [];
+  const last = sh.getLastRow();
+  if (last < 2) return [];
+  const vals = sh.getRange(2,1,last-1,1).getValues(); // [city]
+  return vals.map(r=>String(r[0]||'')).filter(Boolean);
+}
+
+function damerauLevenshtein_(a,b){
+  const al=a.length, bl=b.length;
+  const dp=Array.from({length:al+1},()=>Array(bl+1).fill(0));
+  for (let i=0;i<=al;i++) dp[i][0]=i;
+  for (let j=0;j<=bl;j++) dp[0][j]=j;
+  for (let i=1;i<=al;i++){
+    for (let j=1;j<=bl;j++){
+      const cost = a[i-1]===b[j-1]?0:1;
+      dp[i][j] = Math.min(dp[i-1][j]+1, dp[i][j-1]+1, dp[i-1][j-1]+cost);
+      if (i>1 && j>1 && a[i-1]===b[j-2] && a[i-2]===b[j-1]){
+        dp[i][j] = Math.min(dp[i][j], dp[i-2][j-2]+1);
+      }
+    }
+  }
+  return dp[al][bl];
+}
+
+function fuzzyBest_(s, arr){
+  let best=null;
+  for (const x of arr){
+    const d = damerauLevenshtein_(s, normalizeRus_(x));
+    if (best===null || d<best.distance) best = {match:x, distance:d};
+    if (best.distance===0) break;
+  }
+  return best;
+}
+
+function normalizeCity_(cityInput){
+  const src = String(cityInput||'').trim();
+  if (!src) return {canon:'', conf:0, note:'empty'};
+  const s = normalizeRus_(src);
+  const viaAlias = aliasCity_(s);
+  if (viaAlias) return {canon:viaAlias, conf:0.98, note:'alias'};
+  const viaCache = cacheLookup_(s);
+  if (viaCache && viaCache.normalized_city) return {canon:viaCache.normalized_city, conf:0.95, note:'cache'};
+  const ref = getCitiesRef_();
+  const m = fuzzyBest_(s, ref);
+  if (m && m.distance <= 2) return {canon:m.match, conf:1 - Math.min(m.distance/5, 0.4), note:'fuzzy'};
+  return {canon:s, conf:0.6, note:'raw'};
+}
+
+/***** REGION RESOLVER (cache → geocoder → AI, then map to sales_region) *****/
+function resolveRegionForRow_(sheet, row, headers, safe){
+  const H = Object.fromEntries(headers.map((h,i)=>[String(h).trim(), i+1]));
+
+  const cityCanon = H['city_canon']
+    ? String(sheet.getRange(row, H['city_canon']).getValue() || '').trim()
+    : '';
+  const cityInput = cityCanon || (
+    H['city_raw']
+      ? String(sheet.getRange(row, H['city_raw']).getValue() || '').trim()
+      : ''
+  );
+
+  if (!cityInput) return;
+
+  let info = null;
+
+  // 0) пробуем кэш
+  try {
+    info = cacheLookup_(cityInput);
+  } catch (e){
+    logError_('resolveRegion/cacheLookup', e);
+  }
+
+  // 1) если в кэше нет и safe == false — вызываем геокодер
+  if (!info && safe === false){
+    const geo = geocodeCity_(cityInput);
+    if (geo && geo.error){
+      if (H['geo_status'])     sheet.getRange(row, H['geo_status']).setValue(geo.error);
+      if (H['region_status'])  sheet.getRange(row, H['region_status']).setValue('Needs review');
+      if (H['region_resolver'])sheet.getRange(row, H['region_resolver']).setValue('GeocoderError');
+      return;
+    }
+    info = geo;
+  }
+
+  // 2) если info так и не появилось — остаёмся в Needs review
+  if (!info){
+    if (H['region_status'])   sheet.getRange(row, H['region_status']).setValue('Needs review');
+    if (H['region_resolver']) sheet.getRange(row, H['region_resolver']).setValue(safe === false ? 'NoCache' : 'SafeNoNet');
+    return;
+  }
+
+  // 3) определяем финальный регион (по admin_area / country)
+  let regionName = info.region || '';
+  const admin    = info.admin_area || '';
+  const country  = info.country || '';
+
+  try {
+    if (!regionName){
+      if (typeof mapAdminToSalesRegion_ === 'function'){
+        regionName = mapAdminToSalesRegion_(admin, country);
+      } else {
+        regionName = admin;
+      }
+    }
+    info.region = regionName;
+  } catch (e){
+    logError_('resolveRegion/mapAdmin', e);
+  }
+
+  // 4) записываем geo поля
+  try {
+    if (H['country'])     sheet.getRange(row, H['country']).setValue(country);
+    if (H['admin_area'])  sheet.getRange(row, H['admin_area']).setValue(admin);
+    if (H['lat'])         sheet.getRange(row, H['lat']).setValue(info.lat || '');
+    if (H['lng'])         sheet.getRange(row, H['lng']).setValue(info.lng || '');
+    if (H['region'])      sheet.getRange(row, H['region']).setValue(regionName);
+  } catch (e){
+    logError_('resolveRegion/writeMain', e);
+  }
+
+  // 5) owner по региону
+  try {
+    if (H['owner'] && regionName && typeof lookupOwner_ === 'function'){
+      const ownerName = lookupOwner_(regionName);
+      sheet.getRange(row, H['owner']).setValue(ownerName);
+    }
+  } catch (e){
+    logError_('resolveRegion/owner', e);
+  }
+
+  // 6) статусы
+  try {
+    if (H['region_status'])      sheet.getRange(row, H['region_status']).setValue(regionName ? 'OK' : 'Needs review');
+    if (H['region_resolver'])    sheet.getRange(row, H['region_resolver']).setValue(info.region_resolver || (safe === false ? 'Geocoder' : 'Cache'));
+    if (H['region_confidence'])  sheet.getRange(row, H['region_confidence']).setValue(info.region_confidence || 0.9);
+    if (H['geo_status'])         sheet.getRange(row, H['geo_status']).setValue(''); // очищаем, если всё ок
+  } catch (e){
+    logError_('resolveRegion/status', e);
+  }
+
+  // 7) обновляем кэш
+  try {
+    cacheStore_(cityInput, info);
+  } catch (e){
+    logError_('resolveRegion/cacheStore', e);
+  }
+}
+
+function lookupOwner_(salesRegion){
+  const sh = SpreadsheetApp.getActive().getSheetByName(CFG.SHEET_OWNERS);
+  if (!sh) return '';
+  const vals = sh.getRange(2,1,Math.max(0,sh.getLastRow()-1),2).getValues();
+  const map = Object.fromEntries(vals);
+  return map[salesRegion] || '';
+}
+
+function setAux_(sheet, row, H, obj){
+  const fields = ['country','admin_area','lat','lng','region_resolver','region_confidence','region_status'];
+  fields.forEach(f=>{
+    if (H[f]) sheet.getRange(row, H[f]).setValue(obj[f] ?? '');
+  });
+}
+
+/***** CACHE *****/
+function cacheLookup_(cityInput){
+  const sh = SpreadsheetApp.getActive().getSheetByName(CFG.SHEET_CACHE);
+  if (!sh) return null;
+  const last = sh.getLastRow();
+  if (last < 2) return null; // нет данных, только шапка
+  const vals = sh.getRange(2,1,last-1,9).getValues(); // city_input,...,region_resolver
+  const key = String(cityInput||'').toLowerCase().trim();
+  for (const r of vals){
+    if (String(r[0]).toLowerCase().trim() === key){
+      return {
+        normalized_city: r[1], country: r[2], admin_area: r[3],
+        lat: r[4], lng: r[5], region: r[6],
+        region_confidence: r[7], region_resolver: r[8]
+      };
+    }
+  }
+  return null;
+}
+
+function cacheUpsert_(cityInput, info){
+  const sh = SpreadsheetApp.getActive().getSheetByName(CFG.SHEET_CACHE);
+  if (!sh) return;
+  const last = sh.getLastRow();
+  const range = sh.getRange(2,1,Math.max(0,last-1),1).getValues();
+  for (let i=0;i<range.length;i++){
+    if (String(range[i][0]).toLowerCase().trim() === cityInput.toLowerCase().trim()){
+      sh.getRange(i+2,1,1,10).setValues([[
+        cityInput,
+        info.normalized_city || cityInput,
+        info.country || CFG.COUNTRY_DEFAULT,
+        info.admin_area || '',
+        info.lat || '',
+        info.lng || '',
+        info.region || '',
+        info.region_confidence || 0,
+        info.region_resolver || '',
+        new Date()
+      ]]);
+      return;
+    }
+  }
+  sh.getRange(last+1,1,1,10).setValues([[
+    cityInput,
+    info.normalized_city || cityInput,
+    info.country || CFG.COUNTRY_DEFAULT,
+    info.admin_area || '',
+    info.lat || '',
+    info.lng || '',
+    info.region || '',
+    info.region_confidence || 0,
+    info.region_resolver || '',
+    new Date()
+  ]]);
+}
+
+// Универсальная нормализация русских названий для сопоставления
+function _normRus_(t){
+  return String(t||'')
+    .toLowerCase()
+    .replace(/ё/g,'е')
+    .replace(/\s*-\s*/g,'-')
+    .replace(/\s+/g,' ')
+    // убираем частые префиксы
+    .replace(/^г\.\s*/,'')          // "г. "
+    .replace(/^город\s+/,'')        // "город "
+    .replace(/^респ(ублика)?\s+/,'')// "респ", "республика "
+    .trim();
+}
+
+/***** MAP admin->sales region *****/
+function mapAdminToSalesRegion_(adminArea, country){
+  if (!adminArea) return '';
+  const sh = SpreadsheetApp.getActive().getSheetByName('Regions_Map');
+  if (!sh) return '';
+  const vals = sh.getRange(2,1,Math.max(0,sh.getLastRow()-1),3).getValues(); // [admin_area, country, sales_region]
+
+  const targetC = String(country||'').toUpperCase().trim() || 'RU';
+  const targetNorm = _normRus_(adminArea);
+
+  // 1) точные совпадения по нормализованным ключам
+  let exactMap = new Map();
+  vals.forEach(([a,c,r])=>{
+    const normA = _normRus_(a);
+    const cISO = String(c||'').toUpperCase().trim() || 'RU';
+    if (cISO===targetC) exactMap.set(normA, r);
+  });
+  if (exactMap.has(targetNorm)) return exactMap.get(targetNorm);
+
+  // 2) фаззи-подбор по тем же записям (порог 2)
+  let best = {d: 999, region: ''};
+  exactMap.forEach((r, normA)=>{
+    const d = _levDamerau_(targetNorm, normA);
+    if (d < best.d) best = {d, region: r};
+  });
+  if (best.d <= 2) return best.region;
+
+  // 3) ничего — вернём пусто, пусть строка пойдёт в Needs review
+  return '';
+}
+
+/***** GEOCODER *****/
+function geocodeCity_(city){
+  if (!city) return {error:'NO_CITY'};
+  try {
+    const key = PropertiesService.getScriptProperties().getProperty('GEOCODER_API_KEY');
+    if (!key) return {error:'NO_KEY'};
+
+    const url = 'https://maps.googleapis.com/maps/api/geocode/json'
+      + '?address=' + encodeURIComponent(city)
+      + '&language=ru&region=ru'
+      + '&key=' + key;
+
+    const res = UrlFetchApp.fetch(url, {muteHttpExceptions:true});
+    const data = JSON.parse(res.getContentText());
+
+    if (data.status !== 'OK') {
+      return {error: data.status};
+    }
+
+    const best = data.results[0];
+    const comps = best.address_components || [];
+    const getPart = (type) => {
+      const c = comps.find(c => (c.types || []).indexOf(type) !== -1);
+      return c ? c.long_name : '';
+    };
+
+    const cityName  = getPart('locality') || city;
+    const admin1    = getPart('administrative_area_level_1');
+    const country   = (comps.find(c => (c.types || []).indexOf('country') !== -1) || {}).short_name || '';
+    const loc       = best.geometry && best.geometry.location || {};
+
+    return {
+      city_canon: cityName,
+      country: country,
+      admin_area: admin1,
+      lat: loc.lat || '',
+      lng: loc.lng || '',
+      region: '',                   // регион посчитаем отдельно
+      region_resolver: 'Geocoder',
+      region_confidence: 0.9
+    };
+  } catch (e){
+    return {error: 'EXC:' + e};
+  }
+}
+
+/***** AI AGENT (optional) *****/
+function aiNormalizeCity_(cityInput){
+  try{
+    const key = PropertiesService.getScriptProperties().getProperty('LLM_API_KEY');
+    if (!key) return null;
+    const prompt = `
+    Задача: по входному названию населённого пункта определить нормализованное название города, страну (ISO2), административный регион и присвоить один из внутренних "sales_region".
+    Верни JSON строго в формате:
+    {"normalized_city":"...", "country":"RU", "admin_area":"...", "region":"<sales_region>", "confidence":0.0}
+    Вход: "${cityInput}"
+`;
+    const resp = UrlFetchApp.fetch('https://your-llm-endpoint/v1/complete', {
+      method: 'post',
+      contentType: 'application/json',
+      headers: { 'Authorization': 'Bearer ' + key },
+      payload: JSON.stringify({prompt, temperature: 0.2})
+    });
+    const text = resp.getContentText();
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+    const obj = JSON.parse(jsonMatch[0]);
+    return {
+      normalized_city: obj.normalized_city || cityInput,
+      country: obj.country || CFG.COUNTRY_DEFAULT,
+      admin_area: obj.admin_area || '',
+      region: obj.region || '',
+      region_confidence: obj.confidence || 0.6,
+      region_resolver: 'AI'
+    };
+  } catch(e){
+    console.error('aiNormalizeCity_ error', e);
+    return null;
+  }
+}
+
+/***** EMAIL CANONICALIZATION *****/
+function canonicalEmail_(email){
+  const e = String(email||'').toLowerCase().trim();
+  const m = e.match(/^([^@]+)@([^@]+)$/);
+  if (!m) return e;
+  let local = m[1], domain = m[2];
+  if (domain==='gmail.com' || domain==='googlemail.com'){
+    local = local.replace(/\./g,'').replace(/\+.*/,'');
+    domain = 'gmail.com';
+  }
+  return local + '@' + domain;
+}
+
+/***** DEDUPE *****/
+function dupScoreBetween_(a, b){
+  if (a.phone_e164 && b.phone_e164 && a.phone_e164 === b.phone_e164) return {score:1.0, reason:'phone_e164'};
+  const tailA = phoneTailKey_(a.phone_clean, 8);
+  const tailB = phoneTailKey_(b.phone_clean, 8);
+  if (tailA && tailB && tailA === tailB) return {score:0.95, reason:'phone_tail_8'};
+  if (a.email && b.email && canonicalEmail_(a.email) === canonicalEmail_(b.email)) return {score:0.95, reason:'email'};
+  const nameD = damerauLevenshtein_(normalizeRus_(a.name||''), normalizeRus_(b.name||''));
+  const cityD = damerauLevenshtein_(normalizeRus_(a.city_canon||''), normalizeRus_(b.city_canon||''));
+  if (nameD<=1 && cityD<=1) return {score:0.8, reason:`fuzzy_name_city_${nameD}/${cityD}`};
+  if (nameD<=1 && tailA && tailB && tailA===tailB) return {score:0.85, reason:`name+phone_tail_${nameD}`};
+  return {score:0.0, reason:''};
+}
+
+//дедуп по названию компании
+function dedupeByCompany_(sheet, headers, row){
+  const H = headers;
+  if (!H['company_canon']) return;
+  if (!H['is_duplicate'] || !H['duplicate_of']) return;
+
+  const thisCanon = (sheet.getRange(row, H['company_canon']).getValue() || '').trim();
+  if (!thisCanon) return;
+
+  const lastRow = sheet.getLastRow();
+  for (let r = 2; r <= lastRow; r++){
+    if (r === row) continue;
+
+    const canon = (sheet.getRange(r, H['company_canon']).getValue() || '').trim();
+    if (!canon) continue;
+
+    // точное совпадение после нормализации
+    if (canon === thisCanon){
+      sheet.getRange(row, H['is_duplicate']).setValue(true);
+      sheet.getRange(row, H['duplicate_of']).setValue(sheet.getRange(r, H['lead_id']).getValue());
+      return;
+    }
+
+    // мягкое сравнение: расстояние Левенштейна
+    if (levenshteinDistance_(canon, thisCanon) <= 2){
+      sheet.getRange(row, H['is_duplicate']).setValue(true);
+      sheet.getRange(row, H['duplicate_of']).setValue(sheet.getRange(r, H['lead_id']).getValue());
+      return;
+    }
+  }
+
+  // если не нашли дублей, снимаем флаг
+  sheet.getRange(row, H['is_duplicate']).setValue(false);
+  sheet.getRange(row, H['duplicate_of']).setValue('');
+}
+
+// функция Левенштейна
+function levenshteinDistance_(a, b) {
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+
+  const matrix = [];
+
+  for (let i = 0; i <= b.length; i++){
+    matrix[i] = [i];
+  }
+
+  for (let j = 0; j <= a.length; j++){
+    matrix[0][j] = j;
+  }
+
+  for (let i = 1; i <= b.length; i++){
+    for (let j = 1; j <= a.length; j++){
+      if (b.charAt(i - 1) === a.charAt(j - 1)){
+        matrix[i][j] = matrix[i - 1][j - 1];
+      } else {
+        matrix[i][j] = Math.min(
+          matrix[i - 1][j - 1] + 1,
+          matrix[i][j - 1] + 1,
+          matrix[i - 1][j] + 1
+        );
+      }
+    }
+  }
+
+  return matrix[b.length][a.length];
+}
+
+/**
+ * Простая дедупликация по телефону:
+ * - сбрасываем флаг дубля
+ * - ищем другие строки с тем же phone_e164
+ * - если нашли -> помечаем как дубль
+ */
+function dedupeRowFuzzy_(sheet, headers, row){
+  const H = Object.fromEntries(headers.map((h,i)=>[String(h).trim(), i+1]));
+
+  const colPhone = H['phone_e164'] || H['phone_clean'];
+  const colDupFlag = H['is_duplicate'];
+  const colDupOf = H['duplicate_of'];
+  const colDupScore = H['dup_score']; // если есть
+
+  if (!colPhone || !colDupFlag) {
+    return; // нет нужных колонок
+  }
+
+  const lastRow = sheet.getLastRow();
+  if (row < 2 || row > lastRow) return;
+
+  // 1) читаем телефон текущей строки
+  const phone = String(sheet.getRange(row, colPhone).getValue() || '').trim();
+  if (!phone){
+    // если телефона нет — просто сбрасываем флаги и выходим
+    sheet.getRange(row, colDupFlag).setValue(false);
+    if (colDupOf)    sheet.getRange(row, colDupOf).clearContent();
+    if (colDupScore) sheet.getRange(row, colDupScore).clearContent();
+    return;
+  }
+
+  // 2) СНАЧАЛА сбрасываем флаги дубля
+  sheet.getRange(row, colDupFlag).setValue(false);
+  if (colDupOf)    sheet.getRange(row, colDupOf).clearContent();
+  if (colDupScore) sheet.getRange(row, colDupScore).clearContent();
+
+  // 3) ищем другие строки с таким же телефоном
+  const phoneRange = sheet.getRange(2, colPhone, lastRow-1, 1).getValues();
+  let foundLeadId = '';
+  for (let i = 0; i < phoneRange.length; i++){
+    const r = i + 2;
+    if (r === row) continue; // не сравниваем сам с собой
+
+    const p = String(phoneRange[i][0] || '').trim();
+    if (!p) continue;
+    if (p === phone){
+      // нашли дубль
+      if (H['lead_id']){
+        foundLeadId = sheet.getRange(r, H['lead_id']).getValue() || '';
+      }
+      // помечаем текущую строку
+      sheet.getRange(row, colDupFlag).setValue(true);
+      if (colDupOf)    sheet.getRange(row, colDupOf).setValue(foundLeadId || '');
+      if (colDupScore) sheet.getRange(row, colDupScore).setValue(1); // простой скор = 1
+      return; // достаточно одного совпадения
+    }
+  }
+
+  // 4) если сюда дошли — других таких телефонов нет, флаг уже сброшен выше
+}
+
+
+// --- PATCH: CIS country-level mapping ---
+function mapCountryToSalesRegion_(countryISO2){
+  const sh = SpreadsheetApp.getActive().getSheetByName('CIS_Country_Map');
+  if (!sh || !countryISO2) return '';
+  const vals = sh.getRange(2,1,Math.max(0,sh.getLastRow()-1),2).getValues(); // [country, sales_region]
+  const map = Object.fromEntries(vals.map(([c,r])=>[String(c||'').toUpperCase().trim(), r]));
+  return map[String(countryISO2||'').toUpperCase().trim()] || '';
+}
+
+// Override resolveRegionForRow_ decision tree:
+/*
+Priority:
+1) If country != RU and mapCountryToSalesRegion_ gives a bucket -> use it (CIS region owner).
+2) Else if country == RU:
+   - use mapAdminToSalesRegion_ by admin_area.
+   - if admin_area empty, try geocoder/AI again or leave 'Needs review'.
+3) Else (non-CIS world): optional 'International' bucket (add to CIS_Country_Map as "XX", "International").
+*/
+
+function processRow_(sheet, row, safe){
+  if (safe === undefined) safe = false;
+
+  const headers = sheet.getRange(1,1,1,sheet.getLastColumn()).getValues()[0];
+  const H = Object.fromEntries(headers.map((h,i)=>[String(h).trim(), i+1]));
+
+  // 1) ID и даты
+  try {
+    if (typeof ensureCreatedAndId_ === 'function') {
+      ensureCreatedAndId_(sheet, row, headers);
+    }
+  } catch(e){logError_('processRow_/ensureCreatedAndId', e, {row});}
+
+  // 2) Город → канон
+  try {
+    if (H['city_raw'] && typeof normalizeCity_ === 'function') {
+      const raw = sheet.getRange(row, H['city_raw']).getValue();
+      const norm = normalizeCity_(raw) || {};
+      if (H['city_canon'])        sheet.getRange(row, H['city_canon']).setValue(norm.canon || '');
+      if (H['city_confidence'])   sheet.getRange(row, H['city_confidence']).setValue(norm.conf || '');
+      if (H['city_note'])         sheet.getRange(row, H['city_note']).setValue(norm.note || '');
+    }
+  } catch(e){logError_('processRow_/normalizeCity', e, {row});}
+
+  // 3) Регион + owner
+  try {
+    if (typeof resolveRegionForRow_ === 'function') {
+      resolveRegionForRow_(sheet, row, headers, safe);
+    }
+  } catch(e){logError_('processRow_/resolveRegion', e, {row});}
+
+  // 4) Телефон
+  try {
+    if (H['phone_raw'] && typeof normalizePhone_ === 'function') {
+      const info = normalizePhone_(sheet.getRange(row, H['phone_raw']).getValue(), 'RU') || {};
+      if (H['phone_clean']) sheet.getRange(row, H['phone_clean']).setValue(info.clean || '');
+      if (H['phone_e164'])  sheet.getRange(row, H['phone_e164']).setValue(info.e164 || '');
+      if (H['phone_valid']) sheet.getRange(row, H['phone_valid']).setValue(info.valid);
+      if (H['phone_note'])  sheet.getRange(row, H['phone_note']).setValue(info.note || '');
+    }
+  } catch(e){    logError_('processRow_/normalizePhone', e, {row});}
+
+  // --- Normalizing company name ---
+try {
+  if (H['Название компании'] && H['company_canon']) {
+    const rawCompany = sheet.getRange(row, H['Название компании']).getValue();
+    const canon      = normalizeCompanyName_(rawCompany);
+    sheet.getRange(row, H['company_canon']).setValue(canon);
+  }
+} catch(e){}
+
+try {
+  dedupeByCompany_(sheet, H, row);
+} catch(e){logError_('processRow_/dedupe', e, {row});}
+
+
+  // 5) Дедуп
+  try {
+    if (typeof dedupeRowFuzzy_ === 'function') {
+      dedupeRowFuzzy_(sheet, headers, row);
+    }
+  } catch(e){logError_('processRow_/dedupe', e, {row});}
+
+  // 6) Флаг Needs Review (всегда В САМОМ КОНЦЕ)
+  try {
+    updateReviewFlagsForRow_(sheet, row, headers);
+  } catch(e){logError_('processRow_/updateReviewFlags', e, {row});}
+
+  // 7) processed_at — по желанию
+  try {
+    if (H['processed_at'] && !sheet.getRange(row, H['processed_at']).getValue()){
+      sheet.getRange(row, H['processed_at']).setValue(new Date());
+    }
+  } catch(e){logError_('processRow_/processed_at', e, {row});}
+}
+
+function installEditTrigger(){
+  // сначала удалим все старые триггеры, чтобы не было кучи onEdit
+  ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t));
+  // ставим новый installable-триггер
+  ScriptApp.newTrigger('onEditHeavy')
+    .forSpreadsheet(SpreadsheetApp.getActive())
+    .onEdit()
+    .create();
+}
+
+function _setIf_(sh,row,H,key,val){ if (H[key]) sh.getRange(row, H[key]).setValue(val); }
+
+/**
+ * === Cities_Cache ===
+ * Структура листа:
+ *   A: city_input
+ *   B: city_canon
+ *   C: country
+ *   D: admin_area
+ *   E: region
+ *   F: lat
+ *   G: lng
+ *   H: resolver
+ *   I: confidence
+ */
+
+/** Чтение из кэша */
+function cacheLookup_(city){
+  if (!city) return null;
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName('Cities_Cache');
+  if (!sh) return null;
+
+  const last = sh.getLastRow();
+  if (last < 2) return null;
+
+  const vals = sh.getRange(2, 1, last-1, 9).getValues();
+  const key = String(city).trim().toLowerCase();
+
+  for (let i = 0; i < vals.length; i++){
+    const input = String(vals[i][0] || '').trim().toLowerCase();
+    if (input === key){
+      return {
+        city_canon: vals[i][1],
+        country: vals[i][2],
+        admin_area: vals[i][3],
+        region: vals[i][4],
+        lat: vals[i][5],
+        lng: vals[i][6],
+        region_resolver: vals[i][7],
+        region_confidence: vals[i][8]
+      };
+    }
+  }
+  return null;
+}
+
+/** Запись/обновление строки в кэше */
+function cacheStore_(city, info){
+  if (!city || !info) return;
+
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName('Cities_Cache');
+  if (!sh) return;
+
+  const last = sh.getLastRow();
+  const key = String(city).trim().toLowerCase();
+
+  // ищем существующую запись
+  if (last >= 2){
+    const vals = sh.getRange(2, 1, last-1, 1).getValues();
+    for (let i = 0; i < vals.length; i++){
+      const input = String(vals[i][0] || '').trim().toLowerCase();
+      if (input === key){
+        // обновляем запись
+        sh.getRange(i+2, 2, 1, 8).setValues([[
+          info.city_canon || '',
+          info.country || '',
+          info.admin_area || '',
+          info.region || '',
+          info.lat || '',
+          info.lng || '',
+          info.region_resolver || '',
+          info.region_confidence || 1
+        ]]);
+        return;
+      }
+    }
+  }
+
+  // иначе — добавляем новую строку
+  sh.appendRow([
+    city,
+    info.city_canon || '',
+    info.country || '',
+    info.admin_area || '',
+    info.region || '',
+    info.lat || '',
+    info.lng || '',
+    info.region_resolver || '',
+    info.region_confidence || 1
+  ]);
+}
+
+/** Пересчитать ТЕКУЩУЮ строку (лайтово, без геокодера — safe=true) */
+function recalcCurrentRowLight(){
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getActiveSheet();
+  if (sh.getName() !== 'Leads (Master)') return;
+
+  const row = sh.getActiveCell().getRow();
+  if (row === 1) return;
+
+  processRow_(sh, row, true);  // safe = true → без UrlFetch/гео
+}
+
+/** Пересчитать ТЕКУЩУЮ строку ПОЛНОСТЬЮ (с геокодером, дублями, owner) */
+function recalcCurrentRowFull(){
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getActiveSheet();
+  if (sh.getName() !== 'Leads (Master)') return;
+
+  const row = sh.getActiveCell().getRow();
+  if (row === 1) return;
+
+  processRow_(sh, row, false); // safe = false → максимум логики
+}
+
+/** Пересчитать ВЫДЕЛЕННЫЕ строки полностью (safe=false) */
+function recalcSelectionFull(){
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getActiveSheet();
+  if (sh.getName() !== 'Leads (Master)') return;
+
+  const sel = sh.getActiveRange();
+  if (!sel) return;
+
+  const startRow = Math.max(2, sel.getRow()); // не трогаем шапку
+  const endRow   = sel.getLastRow();
+
+//  const headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
+
+  for (let row = startRow; row <= endRow; row++){
+    try {
+      processRow_(sh, row, false); // safe = false → полный пересчёт (включая геокодер, если он настроен)
+    } catch(e){
+      logError_ && logError_('recalcSelectionFull row '+row, e);
+    }
+  }
+}
+
+/** Пересчитать ВСЕ лиды (full, со 2-й строки до конца) */
+function recalcAllLeadsFull(){
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName('Leads (Master)');
+  if (!sh) throw new Error('Нет листа "Leads (Master)"');
+
+  // это последним добавил
+  const user = Session.getActiveUser().getEmail() || 'unknown';
+
+  logInfo_('recalcAllLeadsFull/start', 'Запуск полного пересчёта всех лидов', {user});
+
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return;
+
+  for (let row = 2; row <= lastRow; row++){
+    try {
+      processRow_(sh, row, false);
+    } catch(e){
+      if (typeof logError_ === 'function') {
+        logError_('recalcAllLeadsFull row '+row, e);
+      }
+    }
+    logInfo_('recalcAllLeadsFull/end', 'Полный пересчёт завершён', {user, rows:lastRow-1});
+  }
+
+  try {
+    SpreadsheetApp.getActive().toast('Пересчитаны все лиды ('+(lastRow-1)+' строк)');
+  } catch(e) {
+    // если UI недоступен — просто молчим
+  }
+}
+
+function applyStatusValidation(){
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName('Leads (Master)');
+  if (!sh) throw new Error('Нет листа "Leads (Master)"');
+
+  const headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
+  const H = Object.fromEntries(headers.map((h,i)=>[String(h).trim(), i+1]));
+
+  if (!H['stage'] || !H['substatus']) {
+    throw new Error("В шапке нужны столбцы 'stage' и 'substatus'");
+  }
+
+  const stageValues = ['New','In progress','Follow-up','Won','Lost','On hold'];
+  const substatusValues = [
+    'New',
+    'Called',
+    'Waiting reply',
+    'Negotiation',
+    'Planned',
+    'Missed',
+    'Rescheduled',
+    'Contract signed',
+    'First order',
+    'Pilot',
+    'No interest',
+    'Too expensive',
+    'Competitor',
+    'No contact',
+    'Later',
+    'No stock',
+    'Internal'
+  ];
+
+  const lastRow = sh.getLastRow() || 2;
+
+  // stage
+  const ruleStage = SpreadsheetApp.newDataValidation()
+    .requireValueInList(stageValues, true)
+    .setAllowInvalid(false)
+    .build();
+
+  sh.getRange(2, H['stage'], lastRow-1 || 1, 1).setDataValidation(ruleStage);
+
+  // substatus
+  const ruleSub = SpreadsheetApp.newDataValidation()
+    .requireValueInList(substatusValues, true)
+    .setAllowInvalid(true) // можно оставить пустым
+    .build();
+
+  sh.getRange(2, H['substatus'], lastRow-1 || 1, 1).setDataValidation(ruleSub);
+}
+
+function updateLastTouch_(sheet, row, headers, editedColumn){
+  const H = Object.fromEntries(headers.map((h,i)=>[String(h).trim(), i+1]));
+  if (!H['last_touch_at']) return;
+
+  // какие поля считаем "контактом"
+  const touchCols = ['stage','substatus','notes','owner','next_action_at'];
+
+  const touched = touchCols.some(key => H[key] && H[key] === editedColumn);
+  if (!touched) return;
+
+  sheet.getRange(row, H['last_touch_at']).setValue(new Date());
+}
+
+function markCurrentAsInProgress3d(){
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName('Leads (Master)');
+  if (!sh) return;
+
+  const row = sh.getActiveCell().getRow();
+  if (row === 1) return;
+
+  const headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
+  const H = Object.fromEntries(headers.map((h,i)=>[String(h).trim(), i+1]));
+
+  const now = new Date();
+  const next = new Date(now.getTime() + 3*24*60*60*1000); // +3 дня
+
+  const stageName = getStageByCode_('in_progress');
+  if (!stageName) {
+    SpreadsheetApp.getActive().toast('Не найден статус для кода in_progress в StatusList');
+    return;
+  }
+
+  if (H['stage'])          sh.getRange(row, H['stage']).setValue(stageName);
+  if (H['substatus'])      sh.getRange(row, H['substatus']).setValue('Planned'); // подстатусы можем потом тоже вынести в справочник
+  if (H['next_action_at']) sh.getRange(row, H['next_action_at']).setValue(next);
+
+  processRow_(sh, row, true);
+}
+
+function markCurrentAsWon(){
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName('Leads (Master)');
+  if (!sh) return;
+
+  const row = sh.getActiveCell().getRow();
+  if (row === 1) return;
+
+  const headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
+  const H = Object.fromEntries(headers.map((h,i)=>[String(h).trim(), i+1]));
+
+  const stageName = getStageByCode_('won');
+  if (!stageName) {
+    SpreadsheetApp.getActive().toast('Не найден статус для кода won в StatusList');
+    return;
+  }
+
+  if (H['stage'])     sh.getRange(row, H['stage']).setValue(stageName);
+  if (H['substatus']) sh.getRange(row, H['substatus']).setValue('Contract signed');
+
+  processRow_(sh, row, true);
+}
+
+function markCurrentAsLostNoInterest(){
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName('Leads (Master)');
+  if (!sh) return;
+
+  const row = sh.getActiveCell().getRow();
+  if (row === 1) return;
+
+  const headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
+  const H = Object.fromEntries(headers.map((h,i)=>[String(h).trim(), i+1]));
+
+  const stageName = getStageByCode_('lost');
+  if (!stageName) {
+    SpreadsheetApp.getActive().toast('Не найден статус для кода lost в StatusList');
+    return;
+  }
+
+  if (H['stage'])     sh.getRange(row, H['stage']).setValue(stageName);
+  if (H['substatus']) sh.getRange(row, H['substatus']).setValue('No interest');
+
+  processRow_(sh, row, true);
+}
+
+function getStageByCode_(code){
+  if (!code) return '';
+
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName('StatusList');
+  if (!sh) throw new Error('Нет листа "StatusList"');
+
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return '';
+
+  const vals = sh.getRange(2, 1, lastRow - 1, 2).getValues(); // A2:B
+
+  const target = String(code).trim().toLowerCase();
+  for (let i = 0; i < vals.length; i++){
+    const stageName = String(vals[i][0] || '').trim();
+    const codeVal   = String(vals[i][1] || '').trim().toLowerCase();
+
+    if (codeVal && codeVal === target){
+      return stageName; // возвращаем текст статуса из колонки A
+    }
+  }
+  return '';
+}
+
+//нормализируем названия компаний
+function normalizeCompanyName_(raw){
+  if (!raw) return '';
+
+  let name = String(raw).toLowerCase().trim();
+
+  // Убираем юр. формы
+  name = name
+    .replace(/ооо/g, '')
+    .replace(/оао/g, '')
+    .replace(/зао/g, '')
+    .replace(/ао/g, '')
+    .replace(/ип/g, '')
+    .replace(/индивидуальный предприниматель/g, '')
+    .replace(/«|»|\"|\'/g, '')
+    .replace(/\./g, ' ')
+    .replace(/,/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return name;
+}
+
+function getOrCreateSheet_(name){
+  const ss = SpreadsheetApp.getActive();
+  return ss.getSheetByName(name) || ss.insertSheet(name);
+}
+
+
+
+/** Универсальный сбор строк выделения (учтёт RangeList/диапазоны), игнорирует шапку */
+function _getSelectedRows_(){
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getActiveSheet();
+  if (!sh) return {sheet:null, rows:[]};
+
+  const rows = new Set();
+  const rl = ss.getActiveRangeList();
+  if (rl){
+    rl.getRanges().forEach(r=>{
+      for (let i=r.getRow(); i<=r.getLastRow(); i++) rows.add(i);
+    });
+  } else {
+    const r = sh.getActiveRange();
+    if (r){
+      for (let i=r.getRow(); i<=r.getLastRow(); i++) rows.add(i);
+    }
+  }
+  return {sheet: sh, rows: Array.from(rows).filter(n=>n>1).sort((a,b)=>a-b)};
+}
+
+/** Логгер в лист Debug_Log */
+function LOG_(obj){
+  try{
+    const sh = SpreadsheetApp.getActive().getSheetByName('Debug_Log') || SpreadsheetApp.getActive().insertSheet('Debug_Log');
+    sh.appendRow([new Date(), Session.getActiveUser().getEmail(), JSON.stringify(obj)]);
+  }catch(_){}
+}
+
+/** Покажем последние 10 записей лога */
+function showLastErrors(){
+  const sh = SpreadsheetApp.getActive().getSheetByName('Debug_Log');
+  if (!sh){ SpreadsheetApp.getUi().alert('Лог пуст'); return; }
+  const last = sh.getLastRow();
+  const from = Math.max(2, last-9);
+  const vals = sh.getRange(from,1,last-from+1,3).getValues().map(r=>r.join(' | ')).join('\n');
+  SpreadsheetApp.getUi().alert(vals || 'Лог пуст');
+}
+
+function recalcCurrentRow(){
+  try{
+    const {sheet, rows} = _getSelectedRows_();
+    if (!sheet) throw new Error('Не удалось определить активный лист.');
+    if (sheet.getName() !== 'Leads (Master)') throw new Error('Вы не на листе "Leads (Master)".');
+    if (rows.length===0) throw new Error('Выделите хотя бы одну строку с данными (не шапку).');
+
+    const headers = sheet.getRange(1,1,1,sheet.getLastColumn()).getValues()[0];
+    _recalcRow_(sheet, rows[0], headers, /*safe=*/false);
+    SpreadsheetApp.getActive().toast('Строка '+rows[0]+' пересчитана');
+  }catch(e){
+    LOG_({where:'recalcCurrentRow', error:String(e), stack:e && e.stack});
+    SpreadsheetApp.getUi().alert('Ошибка: '+e);
+  }
+}
+
+function recalcCurrentRowSAFE(){
+  try{
+    const {sheet, rows} = _getSelectedRows_();
+    if (!sheet) throw new Error('Не удалось определить активный лист.');
+    if (sheet.getName() !== 'Leads (Master)') throw new Error('Вы не на листе "Leads (Master)".');
+    if (rows.length===0) throw new Error('Выделите хотя бы одну строку (не шапку).');
+
+    const headers = sheet.getRange(1,1,1,sheet.getLastColumn()).getValues()[0];
+    _recalcRow_(sheet, rows[0], headers, /*safe=*/true);
+    SpreadsheetApp.getActive().toast('SAFE: строка '+rows[0]+' пересчитана (без геокодера)');
+  }catch(e){
+    LOG_({where:'recalcCurrentRowSAFE', error:String(e), stack:e && e.stack});
+    SpreadsheetApp.getUi().alert('Ошибка (SAFE): '+e);
+  }
+}
+
+function recalcSelection(){
+  try{
+    const {sheet, rows} = _getSelectedRows_();
+    if (!sheet) throw new Error('Не удалось определить активный лист.');
+    if (sheet.getName() !== 'Leads (Master)') throw new Error('Вы не на листе "Leads (Master)".');
+    if (rows.length===0) throw new Error('Выделите хотя бы одну строку (не шапку).');
+
+    const headers = sheet.getRange(1,1,1,sheet.getLastColumn()).getValues()[0];
+    rows.forEach(r => _recalcRow_(sheet, r, headers, /*safe=*/false));
+    SpreadsheetApp.getActive().toast('Готово: пересчитано строк — '+rows.length);
+  }catch(e){
+    LOG_({where:'recalcSelection', error:String(e), stack:e && e.stack});
+    SpreadsheetApp.getUi().alert('Ошибка: '+e);
+  }
+}
+
+/** Пересчёт 1 строки. safe=true — без сетевых вызовов */
+function _recalcRow_(sh, row, headers, safe){
+  try{
+    const H = Object.fromEntries(headers.map((h,i)=>[h, i+1]));
+    // нормализация города
+    if (H['city_raw']) {
+      const raw = sh.getRange(row, H['city_raw']).getValue();
+      const norm = normalizeCity_(raw);
+      _setIf_(sh,row,H,'city_canon',norm.canon);
+      _setIf_(sh,row,H,'city_confidence',norm.conf);
+      _setIf_(sh,row,H,'city_note',norm.note);
+    }
+    // регион (с параметром safe)
+    resolveRegionForRow_(sh, row, headers, safe);
+
+    // телефон
+    if (H['phone_raw']) {
+      const info = normalizePhone_(sh.getRange(row, H['phone_raw']).getValue(), 'RU');
+      _setIf_(sh,row,H,'phone_clean',info.clean);
+      _setIf_(sh,row,H,'phone_e164',info.e164);
+      _setIf_(sh,row,H,'phone_valid',info.valid);
+      _setIf_(sh,row,H,'phone_note',info.note);
+    }
+    // дедуп
+    dedupeRowFuzzy_(sh, headers, row);
+  }catch(e){
+    LOG_({where:'_recalcRow_', row, error:String(e), stack:e && e.stack});
+    throw e;
+  }
+}
+
+function _setIf_(sh,row,H,key,val){ if (H[key]) sh.getRange(row, H[key]).setValue(val); }
+
+/** ===== ЭТАП 2: Справочники и валидации ===== */
+
+/** Создаёт/обновляет листы-справочники: Categories, Interviewers, StatusList */
+function setupReferenceLists(){
+  const ss = SpreadsheetApp.getActive();
+  const shCat = getOrCreateSheet_('Categories');
+  const shInt = getOrCreateSheet_('Interviewers');
+  const shSt  = getOrCreateSheet_('StatusList');
+
+  // Категории (можешь править список)
+  const cats = ['Кофейня','Магазин','Дистрибьютор'];
+  writeOneColumn_(shCat, cats);
+
+  // Интервьюеры (заполни своими именами)
+  const interviewers = ['Иванов','Петров','Сидоров'];
+  writeOneColumn_(shInt, interviewers);
+
+  // Статусы (этапы)
+  const statuses = ['New','In work','Qualified','Won','Lost'];
+  writeOneColumn_(shSt, statuses);
+
+  // Подсказываем
+  SpreadsheetApp.getActive().toast('Справочники обновлены: Categories / Interviewers / StatusList');
+}
+
+/** Применяет валидации к колонкам Master по заголовкам */
+function applyValidations(){
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName('Leads (Master)');
+  if (!sh) throw new Error("Нет листа 'Leads (Master)'");
+
+  const header = sh.getRange(1,1,1, sh.getLastColumn() || 1).getValues()[0];
+  const H = Object.fromEntries(header.map((h,i)=>[h, i+1]));
+  const lastRow = Math.max(2, sh.getMaxRows());
+  const dataRange = (col)=> sh.getRange(2, col, lastRow-1, 1);
+
+  const dv = SpreadsheetApp.newDataValidation;
+
+  // Списки из справочников
+  if (H['category']){
+    const r = ss.getSheetByName('Categories').getRange('A:A');
+    const v = dv().requireValueInRange(r, true).setAllowInvalid(false).build();
+    dataRange(H['category']).setDataValidation(v);
+  }
+  if (H['interviewer']){
+    const r = ss.getSheetByName('Interviewers').getRange('A:A');
+    const v = dv().requireValueInRange(r, true).setAllowInvalid(false).build();
+    dataRange(H['interviewer']).setDataValidation(v);
+  }
+  if (H['stage']){
+    const r = ss.getSheetByName('StatusList').getRange('A:A');
+    const v = dv().requireValueInRange(r, true).setAllowInvalid(false).build();
+    dataRange(H['stage']).setDataValidation(v);
+  }
+
+  // Email — стандартная проверка "похоже на email"
+  if (H['email']){
+    const v = dv().requireTextIsEmail().setAllowInvalid(true).build();
+    dataRange(H['email']).setDataValidation(v);
+  }
+
+  // Телефон (сырой ввод): только цифры 10–15 — через кастомную формулу
+  // Формула: =REGEXMATCH(REGEXREPLACE(INDIRECT(ADDRESS(ROW(), COL())), "[^0-9]", ""), "^\d{10,15}$")
+  if (H['phone_raw']){
+    const colA1 = columnToLetter_(H['phone_raw']);
+    const formula = `=REGEXMATCH(REGEXREPLACE(${colA1}2,"[^0-9]",""),"^\\d{10,15}$")`;
+    const v = dv().requireFormulaSatisfied(formula).setAllowInvalid(true).build();
+    dataRange(H['phone_raw']).setDataValidation(v);
+  }
+
+  // known_5yes (если используете) — простой список
+  if (H['known_5yes']){
+    const v = dv().requireValueInList(['Да','Нет','Не уточнил'], true).setAllowInvalid(true).build();
+    dataRange(H['known_5yes']).setDataValidation(v);
+  }
+
+  SpreadsheetApp.getActive().toast('Валидации применены');
+}
+
+/** Утилиты */
+function getOrCreateSheet_(name){
+  const ss = SpreadsheetApp.getActive();
+  return ss.getSheetByName(name) || ss.insertSheet(name);
+}
+function writeOneColumn_(sheet, arr){
+  sheet.clear();
+  sheet.getRange(1,1,arr.length,1).setValues(arr.map(x=>[x]));
+}
+function columnToLetter_(col){
+  let temp = '';
+  while (col > 0) {
+    let rem = (col - 1) % 26;
+    temp = String.fromCharCode(65 + rem) + temp;
+    col = Math.floor((col - rem) / 26);
+  }
+  return temp;
+}
+
+function applyStatusValidation(){
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName('Leads (Master)');
+  if (!sh) throw new Error('Нет листа "Leads (Master)"');
+
+  const headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
+  const H = Object.fromEntries(headers.map((h,i)=>[String(h).trim(), i+1]));
+
+  if (!H['stage']) {
+    throw new Error("В шапке нет столбца 'stage'");
+  }
+
+  // Лист со справочником статусов
+  const statusSh = ss.getSheetByName('StatusList');
+  if (!statusSh) {
+    throw new Error('Нет листа "StatusList"');
+  }
+
+  // Ищем диапазон значений статусов в колонке A (после заголовка)
+  const lastRow = statusSh.getLastRow();
+  if (lastRow < 2) {
+    throw new Error('На листе StatusList нет значений статусов (нужны строки с A2 вниз)');
+  }
+
+  // Диапазон значений статусов (без заголовка)
+  const stageRange = statusSh.getRange(2, 1, lastRow - 1, 1); // A2:A(lastRow)
+
+  // Правило валидации: значение из диапазона StatusList!A2:A
+  const ruleStage = SpreadsheetApp.newDataValidation()
+    .requireValueInRange(stageRange, true)  // true = показывать выпадающий список
+    .setAllowInvalid(false)                 // запрещаем значения не из списка
+    .build();
+
+  const lastLeadRow = sh.getLastRow();
+  if (lastLeadRow < 2) return; // нет данных
+
+  // Вешаем валидацию на все строки по колонке stage (AB, если это она)
+  sh.getRange(2, H['stage'], lastLeadRow - 1, 1).setDataValidation(ruleStage);
+}
+
+function protectServiceColumns(){
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName('Leads (Master)');
+  if (!sh) throw new Error("Нет листа 'Leads (Master)'");
+
+  const headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
+  const H = Object.fromEntries(headers.map((h,i)=>[h, i+1]));
+  const lastRow = Math.max(2, sh.getMaxRows());
+
+  const service = [
+    'lead_id','created_at',
+    'phone_clean','phone_e164','phone_valid','phone_note',
+    'city_canon','city_confidence','city_note',
+    'country','admin_area','lat','lng',
+    'region','region_resolver','region_confidence','region_status','geo_status',
+    'owner',
+    'is_duplicate','duplicate_of','dup_score','dup_reason',
+    'processed_at','last_touch_at'
+  ];
+
+  // Снять старые защиты, созданные скриптом
+  sh.getProtections(SpreadsheetApp.ProtectionType.RANGE)
+    .filter(p => (p.getDescription && String(p.getDescription()).startsWith('5YES-PROTECT:')))
+    .forEach(p => p.remove());
+
+  // Создать новые защиты на диапазоны (warning-only)
+  service.forEach(name=>{
+    const col = H[name];
+    if (!col) return;
+    const rng = sh.getRange(2, col, lastRow-1, 1);
+    const prot = rng.protect();
+    prot.setDescription('5YES-PROTECT:'+name);
+    prot.setWarningOnly(true);
+  });
+
+  console.log('✅ Защита служебных колонок включена (warning-only)');
+}
+
+function unprotectServiceColumns(){
+  const sh = SpreadsheetApp.getActive().getSheetByName('Leads (Master)');
+  if (!sh) return;
+  sh.getProtections(SpreadsheetApp.ProtectionType.RANGE)
+    .filter(p => (p.getDescription && String(p.getDescription()).startsWith('5YES-PROTECT:')))
+    .forEach(p => p.remove());
+  console.log('✅ Защиты, созданные скриптом, сняты');
+}
+
+function applyConditionalFormatting(){
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName('Leads (Master)');
+  if (!sh) throw new Error("Нет листа 'Leads (Master)'");
+
+  const headers = sh.getRange(1,1,1,Math.max(1, sh.getLastColumn())).getValues()[0];
+  const H = Object.fromEntries(headers.map((h,i)=>[h, i+1]));
+
+  const dataRange = (col) => {
+    const maxRows = Math.max(2, sh.getMaxRows());
+    const numRows = Math.max(1, maxRows - 1);
+    return sh.getRange(2, col, numRows, 1);
+  };
+  const wholeRowsRange = (() => {
+    const maxRows = Math.max(2, sh.getMaxRows());
+    const numRows = Math.max(1, maxRows - 1);
+    const lastCol = Math.max(1, sh.getLastColumn());
+    return sh.getRange(2, 1, numRows, lastCol);
+  })();
+
+  const rules = [];
+
+  // 1) phone_valid = FALSE → красный
+  if (H['phone_valid']){
+    rules.push(
+      SpreadsheetApp.newConditionalFormatRule()
+        .setRanges([dataRange(H['phone_valid'])])
+        .whenFormulaSatisfied(`=${columnLetter_(H['phone_valid'])}2=FALSE`)
+        .setBackground('#f28b82')
+        .build()
+    );
+  }
+
+  // 2) city_confidence < 0.8 → жёлтый
+  if (H['city_confidence']){
+    rules.push(
+      SpreadsheetApp.newConditionalFormatRule()
+        .setRanges([dataRange(H['city_confidence'])])
+        .whenFormulaSatisfied(`=${columnLetter_(H['city_confidence'])}2<0.8`)
+        .setBackground('#fce8b2')
+        .build()
+    );
+  }
+
+  // 3) city_note = "raw" → жёлтый
+  if (H['city_note']){
+    rules.push(
+      SpreadsheetApp.newConditionalFormatRule()
+        .setRanges([dataRange(H['city_note'])])
+        .whenTextEqualTo('raw')
+        .setBackground('#fce8b2')
+        .build()
+    );
+  }
+
+  // 4) dup_score ≥ 0.7 и is_duplicate <> TRUE → оранжевый (вся строка)
+  if (H['dup_score'] && H['is_duplicate']){
+    const s = columnLetter_(H['dup_score']);
+    const d = columnLetter_(H['is_duplicate']);
+    rules.push(
+      SpreadsheetApp.newConditionalFormatRule()
+        .setRanges([wholeRowsRange])
+        .whenFormulaSatisfied(`=AND($${s}2>=0.7, NOT($${d}2=TRUE))`)
+        .setBackground('#fbbc04')
+        .build()
+    );
+  }
+
+  // 5) region_status = "Needs review" → розовый (вся строка)
+  if (H['region_status']){
+    const r = columnLetter_(H['region_status']);
+    rules.push(
+      SpreadsheetApp.newConditionalFormatRule()
+        .setRanges([wholeRowsRange])
+        .whenFormulaSatisfied(`=$${r}2="Needs review"`)
+        .setBackground('#ffd6e7')
+        .build()
+    );
+  }
+
+  // 6) geo_status непусто → светло-красный (вся строка)
+  if (H['geo_status']){
+    const g = columnLetter_(H['geo_status']);
+    rules.push(
+      SpreadsheetApp.newConditionalFormatRule()
+        .setRanges([wholeRowsRange])
+        .whenFormulaSatisfied(`=LEN($${g}2)>0`)
+        .setBackground('#f8d7da')
+        .build()
+    );
+  }
+
+  sh.setConditionalFormatRules(rules);
+  SpreadsheetApp.getActive().toast('Условное форматирование применено');
+}
+
+function columnLetter_(col){
+  let s=''; let n=col;
+  while(n>0){ const r=(n-1)%26; s=String.fromCharCode(65+r)+s; n=Math.floor((n-1)/26); }
+  return s;
+}
+
+function applyNextActionFormattingMaster(){
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName('Leads (Master)');
+  if (!sh) throw new Error("Нет листа 'Leads (Master)'");
+
+  const headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
+  const H = Object.fromEntries(headers.map((h,i)=>[String(h).trim(), i+1]));
+  if (!H['next_action_at']) {
+    throw new Error("В шапке нет столбца 'next_action_at'");
+  }
+
+  const col = H['next_action_at'];
+  const lastRow = sh.getMaxRows(); // чтобы правила применялись и к будущим строкам
+
+  const range = sh.getRange(2, col, lastRow-1, 1); // со 2-й строки до конца
+
+  const rules = sh.getConditionalFormatRules() || [];
+  const newRules = [];
+
+  // (опционально) можно отфильтровать старые правила по этому диапазону
+  // пока просто добавим новые не трогая существующие
+  Array.prototype.push.apply(newRules, rules);
+
+  // Просроченные (красный):
+  // =AND(NOT(ISBLANK($AD2)); $AD2 < TODAY())
+  const colLetter = sh.getRange(1, col).getA1Notation().replace(/[0-9]/g, ''); // например "AD"
+  const startRow = 2;
+  const formulaOverdue =
+    `=AND(NOT(ISBLANK($${colLetter}${startRow})); $${colLetter}${startRow}<TODAY())`;
+
+  const ruleOverdue = SpreadsheetApp.newConditionalFormatRule()
+    .setRanges([range])
+    .whenFormulaSatisfied(formulaOverdue)
+    .setBackground('#f4cccc') // светло-красный
+    .build();
+
+  // На сегодня (жёлтый):
+  // =AND(NOT(ISBLANK($AD2)); $AD2 = TODAY())
+  const formulaToday =
+    `=AND(NOT(ISBLANK($${colLetter}${startRow})); $${colLetter}${startRow}=TODAY())`;
+
+  const ruleToday = SpreadsheetApp.newConditionalFormatRule()
+    .setRanges([range])
+    .whenFormulaSatisfied(formulaToday)
+    .setBackground('#fff2cc') // светло-жёлтый
+    .build();
+
+  newRules.push(ruleOverdue, ruleToday);
+  sh.setConditionalFormatRules(newRules);
+}
+
+function applyNextActionFormattingReports(){
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName('Reports');
+  if (!sh) return;
+
+  // Ищем колонку "Next action" по шапке блока A28
+  // но проще знаем, что это D (четвёртая колонка)
+  const startRow = 29; // 28 — шапка, дальше данные
+  const col = 4;       // D
+  const lastRow = sh.getMaxRows();
+
+  const range = sh.getRange(startRow, col, lastRow - startRow + 1, 1);
+
+  const rules = sh.getConditionalFormatRules() || [];
+  const newRules = [];
+  Array.prototype.push.apply(newRules, rules);
+
+  const colLetter = sh.getRange(1, col).getA1Notation().replace(/[0-9]/g, ''); // "D"
+
+  // Просроченные
+  const formulaOverdue =
+    `=AND(NOT(ISBLANK($${colLetter}${startRow})); $${colLetter}${startRow}<TODAY())`;
+  const ruleOverdue = SpreadsheetApp.newConditionalFormatRule()
+    .setRanges([range])
+    .whenFormulaSatisfied(formulaOverdue)
+    .setBackground('#f4cccc')
+    .build();
+
+  // На сегодня
+  const formulaToday =
+    `=AND(NOT(ISBLANK($${colLetter}${startRow})); $${colLetter}${startRow}=TODAY())`;
+  const ruleToday = SpreadsheetApp.newConditionalFormatRule()
+    .setRanges([range])
+    .whenFormulaSatisfied(formulaToday)
+    .setBackground('#fff2cc')
+    .build();
+
+  newRules.push(ruleOverdue, ruleToday);
+  sh.setConditionalFormatRules(newRules);
+}
+
+function applyNextActionFormattingManagerReports(){
+  const ss = SpreadsheetApp.getActive();
+  const sheets = ss.getSheets();
+
+  sheets.forEach(sh => {
+    const name = sh.getName();
+    if (!name.startsWith('Report - ')) return;
+
+    const startRow = 20; // 19 — шапка, дальше данные
+    const col = 5;       // E
+    const lastRow = sh.getMaxRows();
+
+    const range = sh.getRange(startRow, col, lastRow - startRow + 1, 1);
+    const rules = sh.getConditionalFormatRules() || [];
+    const newRules = [];
+    Array.prototype.push.apply(newRules, rules);
+
+    const colLetter = sh.getRange(1, col).getA1Notation().replace(/[0-9]/g, ''); // "E"
+
+    const formulaOverdue =
+      `=AND(NOT(ISBLANK($${colLetter}${startRow})); $${colLetter}${startRow}<TODAY())`;
+    const ruleOverdue = SpreadsheetApp.newConditionalFormatRule()
+      .setRanges([range])
+      .whenFormulaSatisfied(formulaOverdue)
+      .setBackground('#f4cccc')
+      .build();
+
+    const formulaToday =
+      `=AND(NOT(ISBLANK($${colLetter}${startRow})); $${colLetter}${startRow}=TODAY())`;
+    const ruleToday = SpreadsheetApp.newConditionalFormatRule()
+      .setRanges([range])
+      .whenFormulaSatisfied(formulaToday)
+      .setBackground('#fff2cc')
+      .build();
+
+    newRules.push(ruleOverdue, ruleToday);
+    sh.setConditionalFormatRules(newRules);
+  });
+}
+
+function applyNextActionFormattingAll(){
+  applyNextActionFormattingMaster();
+  applyNextActionFormattingReports();
+  applyNextActionFormattingManagerReports();
+}
+
+
+
+function createNeedsReviewViewSmart(){
+  const ss = SpreadsheetApp.getActive();
+  const srcName = 'Leads (Master)';
+  const src = ss.getSheetByName(srcName);
+  if (!src) throw new Error("Нет листа 'Leads (Master)'");
+  const hdr = src.getRange(1,1,1,Math.max(1,src.getLastColumn())).getValues()[0];
+
+  const idx = name => {
+    const i = hdr.findIndex(h => String(h).trim() === name);
+    return i>=0 ? i+1 : 0;
+  };
+
+  const need = {
+    phone_valid:    idx('phone_valid'),
+    city_confidence:idx('city_confidence'),
+    city_note:      idx('city_note'),
+    dup_score:      idx('dup_score'),
+    is_duplicate:   idx('is_duplicate'),
+    region_status:  idx('region_status'),
+    geo_status:     idx('geo_status'),
+  };
+
+  const cond = [];
+  if (need.phone_valid)     cond.push(`Col${need.phone_valid}=FALSE`);
+  if (need.city_confidence) cond.push(`Col${need.city_confidence}<0.8`);
+  if (need.city_note)       cond.push(`Col${need.city_note}='raw'`);
+  if (need.dup_score && need.is_duplicate)
+                            cond.push(`(Col${need.dup_score}>=0.7 and Col${need.is_duplicate}<>TRUE)`);
+  if (need.region_status)   cond.push(`Col${need.region_status}='Needs review'`);
+  if (need.geo_status)      cond.push(`Col${need.geo_status} is not null`); // ← вместо len()
+
+  const where = cond.length ? (' where ' + cond.join(' or ')) : '';
+  const query = `select *${where}`;
+
+  const view = ss.getSheetByName('Needs Review') || ss.insertSheet('Needs Review');
+  view.clear();
+  view.getRange('A1').setFormula(`=QUERY('${srcName}'!A:ZZ, "${query}", 1)`);
+  view.setFrozenRows(1);
+}
+
+/** === SLA-алерт: NEW без касания дольше X часов === */
+function slaAlert(){
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName('Leads (Master)');
+  const data = sh.getDataRange().getValues();
+  const H = Object.fromEntries(data[0].map((h,i)=>[h, i]));
+  const lagHrs = 2; // SLA, правь при необходимости
+  const now = new Date();
+
+  const rows = data.slice(1).filter(r=>{
+    const stage = r[H['stage']];
+    const created = new Date(r[H['created_at']]);
+    const lastTouch = r[H['last_touch_at']] ? new Date(r[H['last_touch_at']]) : null;
+    const ageH = (now - created)/36e5;
+    const untouched = !lastTouch || (now - lastTouch)/36e5 > lagHrs;
+    return stage === 'New' && ageH > lagHrs && untouched;
+  });
+
+  if (!rows.length) return;
+
+  const lines = rows.map(r=>[
+    r[H['lead_id']], r[H['name']], r[H['city_canon']] || r[H['city_raw']],
+    r[H['owner']] || '-', Utilities.formatDate(new Date(r[H['created_at']]), ss.getSpreadsheetTimeZone(), 'yyyy-MM-dd HH:mm')
+  ].join(' | ')).join('\n');
+
+  const to = PropertiesService.getScriptProperties().getProperty('ALERT_EMAIL');
+  if (to) MailApp.sendEmail(to, `SLA: просроченные NEW (${rows.length})`, lines);
+
+  // Телеграм (опционально): одно общее сообщение в служебный чат
+  const token = PropertiesService.getScriptProperties().getProperty('TG_BOT_TOKEN');
+  const serviceChat = PropertiesService.getScriptProperties().getProperty('TG_ALERT_CHAT'); // если хочешь общий чат
+  if (token && serviceChat){
+    tgSend_(token, serviceChat, `SLA NEW (${rows.length}):\n`+lines);
+  }
+}
+
+/** === Ежедневный дайджест: сколько новых, конверсия, топ по владельцам === */
+function dailyDigest(){
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName('Leads (Master)');
+  const data = sh.getDataRange().getValues();
+  const H = Object.fromEntries(data[0].map((h,i)=>[h, i]));
+  const tz = ss.getSpreadsheetTimeZone();
+
+  // границы "сегодня"
+  const start = new Date(); start.setHours(0,0,0,0);
+  const end = new Date();   end.setHours(23,59,59,999);
+
+  const today = data.slice(1).filter(r=>{
+    const created = new Date(r[H['created_at']]);
+    return created >= start && created <= end;
+  });
+
+  const total = today.length;
+  const won = today.filter(r=>r[H['stage']]==='Won').length;
+  const lost = today.filter(r=>r[H['stage']]==='Lost').length;
+
+  // по владельцам
+  const byOwner = {};
+  today.forEach(r=>{
+    const o = r[H['owner']] || '—';
+    byOwner[o] = byOwner[o] || {new:0, won:0, lost:0};
+    byOwner[o].new++;
+    if (r[H['stage']]==='Won') byOwner[o].won++;
+    if (r[H['stage']]==='Lost') byOwner[o].lost++;
+  });
+
+  const lines = Object.entries(byOwner)
+    .map(([o,v])=>`${o}: New ${v.new} | Won ${v.won} | Lost ${v.lost}`).join('\n') || '—';
+
+  const body = [
+    `Дата: ${Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd')}`,
+    `Новые: ${total}`,
+    `Won: ${won} | Lost: ${lost}`,
+    '',
+    'По владельцам:',
+    lines
+  ].join('\n');
+
+  const to = PropertiesService.getScriptProperties().getProperty('ALERT_EMAIL');
+  if (to) MailApp.sendEmail(to, `Дайджест лидов за сегодня`, body);
+}
+
+/** === Мгновенное уведомление при добавлении нового лида (ручной ввод) по владельцу ===
+ * вызывает из processRow_ ОДИН РАЗ (пометим notified_at) */
+function notifyNewLead_(sheet, row){
+  const headers = sheet.getRange(1,1,1,sheet.getLastColumn()).getValues()[0];
+  const H = Object.fromEntries(headers.map((h,i)=>[h, i+1]));
+  if (!H['notified_at']) return; // добавь колонку в шапку
+
+  if (sheet.getRange(row, H['notified_at']).getValue()) return; // уже уведомляли
+  const owner = H['owner'] ? sheet.getRange(row, H['owner']).getValue() : '';
+  if (!owner) return;
+
+  const mapJson = PropertiesService.getScriptProperties().getProperty('TG_CHAT_MAP') || '{}';
+  let chatId = '';
+  try { chatId = JSON.parse(mapJson)[String(owner)] || ''; } catch(e){}
+
+  const token = PropertiesService.getScriptProperties().getProperty('TG_BOT_TOKEN');
+  if (token && chatId){
+    const id = H['lead_id'] ? sheet.getRange(row, H['lead_id']).getValue() : '';
+    const name = H['name'] ? sheet.getRange(row, H['name']).getValue() : '';
+    const city = H['city_canon'] ? (sheet.getRange(row, H['city_canon']).getValue() || sheet.getRange(row, H['city_raw']).getValue()) : '';
+    const phone = H['phone_e164'] ? sheet.getRange(row, H['phone_e164']).getValue() : '';
+    const msg = `Новый лид: ${id}\n${name}\n${city}\n${phone}`;
+    tgSend_(token, chatId, msg);
+    sheet.getRange(row, H['notified_at']).setValue(new Date());
+  }
+}
+
+/** Вставь В КОНЦЕ processRow_ эту строку, чтобы слать уведомления владельцу:
+ *   if (H['owner']) notifyNewLead_(sheet, row);
+ */
+
+/** Телеграм отправка */
+function tgSend_(token, chatId, text){
+  const url = `https://api.telegram.org/bot${token}/sendMessage`;
+  const payload = {chat_id: chatId, text: String(text||'').substring(0,3900)};
+  UrlFetchApp.fetch(url, {method:'post', contentType:'application/json', payload: JSON.stringify(payload), muteHttpExceptions:true});
+}
+
+/** Установка триггеров для оповещений */
+function installAlertTriggers(){
+  ScriptApp.getProjectTriggers().forEach(t=>ScriptApp.deleteTrigger(t));
+  // onEdit уже стоит у тебя; тут только таймеры
+  ScriptApp.newTrigger('slaAlert').timeBased().everyHours(1).create();      // SLA раз в час
+  ScriptApp.newTrigger('dailyDigest').timeBased().atHour(18).everyDays(1).create(); // Дайджест 18:00
+}
+
+
+/** Представления по владельцам: копируем шапку + FILTER для строк */
+function generateOwnerViewsSimple(){
+  const ss = SpreadsheetApp.getActive();
+  const master = ss.getSheetByName('Leads (Master)');
+  if (!master) {
+    console.log('Нет листа "Leads (Master)"');
+    return;
+  }
+
+  const lastCol = master.getLastColumn();
+  const lastRow = master.getLastRow();
+  if (lastRow < 2) {
+    console.log('В Master нет данных (только шапка)');
+    return;
+  }
+
+  const header = master.getRange(1,1,1,lastCol).getValues()[0];
+  const H = Object.fromEntries(header.map((h,i)=>[String(h).trim(), i+1]));
+  const ownerCol = H['owner'];               // <-- если у тебя столбец называется иначе, поменяй здесь
+  if (!ownerCol) {
+    console.log('В шапке нет колонки "owner"');
+    return;
+  }
+
+  // собираем всех владельцев из данных
+  const ownersValues = master.getRange(2, ownerCol, lastRow-1, 1).getValues();
+  const ownersSet = new Set(
+    ownersValues
+      .map(r => String(r[0]||'').trim())
+      .filter(v => v) // не пустые
+  );
+  const owners = Array.from(ownersSet);
+  if (!owners.length){
+    console.log('Нет ни одного owner в данных');
+    return;
+  }
+
+  const columnLetter_ = (col)=>{
+    let s=''; let n=col;
+    while(n>0){ const r=(n-1)%26; s=String.fromCharCode(65+r)+s; n=Math.floor((n-1)/26); }
+    return s;
+  };
+  const ownerColLetter = columnLetter_(ownerCol);
+
+  const sanitizeSheetName_ = (s)=>{
+    let name = String(s||'').trim();
+    name = name.replace(/[\\\/\?\*\[\]]/g,''); // запрещённые символы в имени листа
+    if (!name) name = '—';
+    return name.length>80 ? name.slice(0,80) : name;
+  };
+
+  owners.forEach(ownerName=>{
+    const sheetName = 'Owner | ' + sanitizeSheetName_(ownerName);
+    const viewSheet = ss.getSheetByName(sheetName) || ss.insertSheet(sheetName);
+    viewSheet.clear();
+
+    // 1) копируем шапку из Master
+    viewSheet.getRange(1,1,1,lastCol).setValues([header]);
+
+    // 2) FILTER со 2-й строки: все строки, где owner = этот владелец
+    const escaped = ownerName.replace(/"/g,'""');
+    const formula = `=FILTER('Leads (Master)'!A2:ZZ; 'Leads (Master)'!${ownerColLetter}2:${ownerColLetter}="${escaped}")`;
+    // если у тебя в формулах разделитель запятая — поменяй ; на ,
+
+    viewSheet.getRange(2,1).setFormula(formula);
+    viewSheet.setFrozenRows(1);
+  });
+
+  console.log('Создано/обновлено представлений: ' + owners.length);
+}
+
+/** Удалить все вкладки Owner | ... */
+function deleteOwnerViews(){
+  const ss = SpreadsheetApp.getActive();
+  ss.getSheets()
+    .filter(s => /^Owner \| /.test(s.getName()))
+    .forEach(s => ss.deleteSheet(s));
+  console.log('Все вкладки Owner | ... удалены');
+}
+
+function colToLetter_(col){
+  let temp, letter = '';
+  while (col > 0) {
+    temp = (col - 1) % 26;
+    letter = String.fromCharCode(temp + 65) + letter;
+    col = (col - temp - 1) / 26;
+  }
+  return letter;
+}
+
+function createOwnerSheetFromActiveRow(){
+  const ss = SpreadsheetApp.getActive();
+  const masterName = 'Leads (Master)';
+  const master = ss.getSheetByName(masterName);
+  if (!master) throw new Error('Нет листа "Leads (Master)"');
+
+  const row = master.getActiveCell().getRow();
+  if (row === 1){
+    SpreadsheetApp.getActive().toast('Выберите строку лида');
+    return;
+  }
+
+  const headers = master.getRange(1,1,1,master.getLastColumn()).getValues()[0];
+  const H = Object.fromEntries(headers.map((h,i)=>[String(h).trim(), i+1]));
+
+  if (!H['owner']){
+    throw new Error("В шапке нет столбца 'owner'");
+  }
+
+  const ownerName = String(master.getRange(row, H['owner']).getValue() || '').trim();
+  if (!ownerName){
+    SpreadsheetApp.getActive().toast('В строке не указан owner');
+    return;
+  }
+
+  createOwnerSheetByOwnerName_(ownerName);
+}
+
+function createOwnerSheetsForAll(){
+  const ss = SpreadsheetApp.getActive();
+  const masterName = 'Leads (Master)';
+  const sh = ss.getSheetByName(masterName);
+  if (!sh) throw new Error('Нет листа "Leads (Master)"');
+
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2){
+    SpreadsheetApp.getActive().toast('Нет лидов для разбиения по менеджерам');
+    return;
+  }
+
+  const headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
+  const H = Object.fromEntries(headers.map((h,i)=>[String(h).trim(), i+1]));
+
+  if (!H['owner']){
+    throw new Error("В шапке нет столбца 'owner'");
+  }
+
+  const ownerColIndex = H['owner'];
+  const ownerColLetter = colToLetter_(ownerColIndex);
+  const lastCol = sh.getLastColumn();
+  const lastColLetter = colToLetter_(lastCol);
+
+  const ownersRange = sh.getRange(2, ownerColIndex, lastRow - 1, 1).getValues();
+  const ownersSet = new Set();
+
+  ownersRange.forEach(r => {
+    const v = String(r[0] || '').trim();
+    if (v) ownersSet.add(v);
+  });
+
+  if (ownersSet.size === 0){
+    SpreadsheetApp.getActive().toast('Нет заполненных owner в Leads (Master)');
+    return;
+  }
+
+  ownersSet.forEach(ownerName => {
+    const safeOwner = ownerName.replace(/[\\/?*[\]]/g, '_');
+    let sheetName = 'Leads - ' + safeOwner;
+    if (sheetName.length > 90) sheetName = sheetName.slice(0, 90);
+
+    let ownerSheet = ss.getSheetByName(sheetName);
+    if (!ownerSheet){
+      ownerSheet = ss.insertSheet(sheetName);
+    }
+    ownerSheet.clear();
+
+    const ownerSql = ownerName.replace(/'/g, "''");
+
+    const formula =
+      "=QUERY('" + masterName + "'!A:" + lastColLetter + ";" +
+      "\"select * where " + ownerColLetter + " = '" + ownerSql + "'\";" +
+      "1)";
+
+    ownerSheet.getRange('A1').setFormula(formula);
+    ownerSheet.setFrozenRows(1);
+  });
+
+  SpreadsheetApp.getActive().toast('Обновлены листы для ' + ownersSet.size + ' owner(ов)');
+}
+
+function createOwnerSheetByOwnerName_(ownerName){
+  ownerName = String(ownerName || '').trim();
+  if (!ownerName){
+    SpreadsheetApp.getActive().toast('Не указан owner');
+    return;
+  }
+
+  const ss = SpreadsheetApp.getActive();
+  const masterName = 'Leads (Master)';
+  const master = ss.getSheetByName(masterName);
+  if (!master) throw new Error('Нет листа "Leads (Master)"');
+
+  const lastRow = master.getLastRow();
+  if (lastRow < 2){
+    SpreadsheetApp.getActive().toast('Нет лидов в Master');
+    return;
+  }
+
+  const headers = master.getRange(1,1,1,master.getLastColumn()).getValues()[0];
+  const H = Object.fromEntries(headers.map((h,i)=>[String(h).trim(), i+1]));
+
+  if (!H['owner'] || !H['lead_id']){
+    throw new Error("В шапке Master должны быть 'owner' и 'lead_id'");
+  }
+
+  // ✔ финальный набор колонок для менеджера:
+  const keepCols = [
+    'lead_id',
+    'created_at',
+    'name',
+    'Название компании',
+    'phone_raw',
+    'email',
+    'city_raw',
+    'region',
+    'category',
+    'stage',
+    'substatus',
+    'next_action_at',
+    'notes',
+    'owner'
+  ];
+
+  // Собираем все строки Master, где owner = ownerName
+  const dataAll = master.getRange(2,1,lastRow-1, master.getLastColumn()).getValues();
+  const rows = [];
+  rows.push(keepCols); // заголовок
+
+  dataAll.forEach(r => {
+    const rowOwner = String(r[H['owner']-1] || '').trim();
+    if (rowOwner === ownerName){
+      const rowArr = keepCols.map(colName => {
+        const idx = H[colName];
+        return idx ? r[idx-1] : '';
+      });
+      rows.push(rowArr);
+    }
+  });
+
+  const safeOwner = ownerName.replace(/[\\/?*[\]]/g, '_');
+  let sheetName = 'Leads - ' + safeOwner;
+  if (sheetName.length > 90) sheetName = sheetName.slice(0, 90);
+
+  let sh = ss.getSheetByName(sheetName);
+  if (!sh){
+    sh = ss.insertSheet(sheetName);
+  }
+  sh.clear();
+
+  if (rows.length === 1){
+    sh.getRange(1,1,1,keepCols.length).setValues([keepCols]);
+    SpreadsheetApp.getActive().toast('Для ' + ownerName + ' пока нет лидов');
+  } else {
+    sh.getRange(1,1,rows.length, keepCols.length).setValues(rows);
+  }
+
+  formatOwnerSheet_(sh);
+
+  SpreadsheetApp.getActive().toast('Обновлён лист: ' + sheetName);
+}
+
+function formatOwnerSheet_(sh){
+  const lastRow = sh.getLastRow();
+  const lastCol = sh.getLastColumn();
+  if (lastRow < 1 || lastCol < 1) return;
+
+  // Перенос текста + высота строк
+  sh.getRange(1,1,lastRow,lastCol).setWrap(true);
+  if (lastRow > 1){
+    sh.setRowHeights(2, lastRow-1, 28);
+  }
+
+  // Заголовки
+  const headers = sh.getRange(1,1,1,lastCol).getValues()[0];
+  const H = Object.fromEntries(headers.map((h,i)=>[String(h).trim(), i+1]));
+
+  // Условное форматирование по next_action_at
+  if (H['next_action_at']){
+    const col = H['next_action_at'];
+    const colLetter = colToLetter_(col);
+    const startRow = 2;
+    const numRows = Math.max(lastRow - 1, 1);
+    const range = sh.getRange(startRow, col, numRows, 1);
+
+    const rules = [];
+
+    const formulaOverdue =
+      `=AND(NOT(ISBLANK($${colLetter}${startRow}));$${colLetter}${startRow}<TODAY())`;
+    const ruleOverdue = SpreadsheetApp.newConditionalFormatRule()
+      .setRanges([range])
+      .whenFormulaSatisfied(formulaOverdue)
+      .setBackground('#f4cccc')
+      .build();
+
+    const formulaToday =
+      `=AND(NOT(ISBLANK($${colLetter}${startRow}));$${colLetter}${startRow}=TODAY())`;
+    const ruleToday = SpreadsheetApp.newConditionalFormatRule()
+      .setRanges([range])
+      .whenFormulaSatisfied(formulaToday)
+      .setBackground('#fff2cc')
+      .build();
+
+    rules.push(ruleOverdue, ruleToday);
+    sh.setConditionalFormatRules(rules);
+  }
+
+  // Заморозить заголовок
+  sh.setFrozenRows(1);
+
+  // Обрезаем хвост (оставим небольшой запас)
+  const maxRows = sh.getMaxRows();
+  const lastDataRow = sh.getLastRow();
+  const keepRows = Math.max(lastDataRow + 10, 20);
+  if (maxRows > keepRows){
+    sh.deleteRows(keepRows + 1, maxRows - keepRows);
+  }
+
+  // Защита: запрещаем ломать lead_id, шапку и т.п.
+  const protections = sh.getProtections(SpreadsheetApp.ProtectionType.SHEET);
+  protections.forEach(p => p.remove());
+
+  const prot = sh.protect().setDescription('5Yes: лист менеджера ' + sh.getName());
+  try {
+    prot.removeEditors(prot.getEditors());
+  } catch(e){}
+  if (prot.canDomainEdit()){
+    prot.setDomainEdit(false);
+  }
+
+  // Колонки, которые менеджер может править на своём листе
+  const editableColsNames = [
+    'name',
+    'Название компании',
+    'phone_raw',
+    'email',
+    'city_raw',
+    'category',
+    'stage',
+    'substatus',
+    'next_action_at',
+    'notes',
+    'owner'
+  ];
+
+  const editableRanges = [];
+  const maxRows2 = sh.getMaxRows();
+
+  editableColsNames.forEach(colName => {
+    const colIndex = H[colName];
+    if (colIndex){
+      editableRanges.push(
+        sh.getRange(2, colIndex, maxRows2 - 1, 1)
+      );
+    }
+  });
+
+  prot.setUnprotectedRanges(editableRanges);
+}
+
+function refreshCurrentOwnerSheet(){
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getActiveSheet();
+  const name = sh.getName();
+
+  if (name.startsWith('Leads - ')){
+    const ownerName = name.slice('Leads - '.length);
+    createOwnerSheetByOwnerName_(ownerName);
+  } else if (name === 'Leads (Master)'){
+    createOwnerSheetFromActiveRow();
+  } else {
+    SpreadsheetApp.getActive().toast('Запустите из Leads (Master) или листа Leads - Имя');
+  }
+}
+
+function syncOwnerSheetEditToMaster_(e){
+  const sh = e.range.getSheet();
+  const ss = SpreadsheetApp.getActive();
+  const master = ss.getSheetByName('Leads (Master)');
+  if (!master) return;
+
+  const row = e.range.getRow();
+  const col = e.range.getColumn();
+  if (row === 1) return; // не трогаем шапку
+
+  const headersOwner = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
+  const HOwner = Object.fromEntries(headersOwner.map((h,i)=>[String(h).trim(), i+1]));
+
+  const headerName = String(headersOwner[col-1] || '').trim();
+  if (!headerName) return;
+
+  // только эти поля можно синхронизировать обратно:
+  const editableFields = new Set([
+    'name',
+    'Название компании',
+    'phone_raw',
+    'email',
+    'city_raw',
+    'category',
+    'stage',
+    'substatus',
+    'next_action_at',
+    'notes',
+    'owner'
+  ]);
+
+  if (!editableFields.has(headerName)) return;
+
+  if (!HOwner['lead_id']) return;
+  const leadId = String(sh.getRange(row, HOwner['lead_id']).getValue() || '').trim();
+  if (!leadId) return;
+
+  const masterHeaders = master.getRange(1,1,1,master.getLastColumn()).getValues()[0];
+  const HMaster = Object.fromEntries(masterHeaders.map((h,i)=>[String(h).trim(), i+1]));
+
+  if (!HMaster['lead_id'] || !HMaster[headerName]) return;
+
+  const lastRowMaster = master.getLastRow();
+  const leadRange = master.getRange(2, HMaster['lead_id'], lastRowMaster-1, 1).getValues();
+
+  let targetRow = null;
+  for (let i = 0; i < leadRange.length; i++){
+    if (String(leadRange[i][0]) === leadId){
+      targetRow = 2 + i;
+      break;
+    }
+  }
+  if (!targetRow) return;
+
+  const newValue = (typeof e.value === 'undefined') ? '' : e.value;
+
+  master.getRange(targetRow, HMaster[headerName]).setValue(newValue);
+
+  // Пересчёт логики по лиду
+  try {
+    if (typeof processRow_ === 'function'){
+      processRow_(master, targetRow, true);
+    }
+  } catch(err){
+    if (typeof logError_ === 'function'){
+      logError_('syncOwnerSheetEditToMaster_', err, {row:targetRow, lead_id:leadId});
+    }
+  }
+}
+
+
+function testGeocoderAndCache(){
+  const city = 'Калуга'; // можно поменять на любой город
+  const info = geocodeCity_(city);
+  Logger.log('geocodeCity_ result: ' + JSON.stringify(info));
+
+  if (info && !info.error){
+    cacheStore_(city, info);
+    Logger.log('Записали в Cities_Cache');
+  } else {
+    Logger.log('Не записали в кэш, ошибка: ' + (info && info.error));
+  }
+}
+
+function testCacheWrite(){
+  const testCity = "Калуга";
+  const info = {
+    city_canon: "Калуга",
+    country: "RU",
+    admin_area: "Калужская область",
+    region: "ЦФО",
+    lat: 54.5,
+    lng: 36.3,
+    region_resolver: "Test",
+    region_confidence: 0.99
+  };
+  cacheStore_(testCity, info);
+  Logger.log("OK, записано");
+}
+
+function testGeocodeOnce(){
+  const res = geocodeCity_('Калуга');  // можешь подставить любой город
+  Logger.log(JSON.stringify(res));
+}
+
+function recalcRowFull(){
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName('Leads (Master)');
+  if (!sh) throw new Error('Нет листа Leads (Master)');
+
+  const row = sh.getActiveCell().getRow();  // пересчёт активной строки
+  processRow_(sh, row, false);              // ВАЖНО: safe = false → разрешаем геокодер
+}
+
+function onOpen(e){
+  try {
+    const ui = SpreadsheetApp.getUi();
+
+    ui.createMenu('5Yes Tools')
+      .addItem('↻ Текущая строка (лайт)', 'recalcCurrentRowLight')
+      .addItem('⚡ Текущая строка (FULL)', 'recalcCurrentRowFull')
+      .addItem('☑ Выделенные строки (FULL)', 'recalcSelectionFull')
+      .addItem('♻ Все лиды (FULL)', 'recalcAllLeadsFull')
+      .addSeparator()
+      .addItem('Обновить лист Needs Review', 'createNeedsReviewView')
+      .addSeparator()
+      .addItem('Очистить дубль в выделенных строках', 'clearDuplicateFlagsInSelection')
+      .addSeparator()
+      .addItem('Обновить защиты (5Yes)', 'applyAllProtections')
+      .addItem('❌ Снять ВСЕ защиты', 'removeAllProtections')
+      .addToUi();
+
+    ui.createMenu('5Yes Status')
+      .addItem('▶ В работу + follow-up через 3 дня', 'markCurrentAsInProgress3d')
+      .addItem('❌ Пометить как Lost (No interest)', 'markCurrentAsLostNoInterest')
+      .addItem('✅ Пометить как Won', 'markCurrentAsWon')
+      .addToUi();
+
+    ui.createMenu('5Yes Reports')
+      .addItem('Обновить общий отчёт (Reports)', 'createReportsSheet')
+      .addSeparator()
+      .addItem('Отчёт по менеджеру (по активному лиду)', 'createManagerReportFromActiveRow')
+      .addItem('Отчёт по менеджеру (ввести имя)', 'createManagerReportFromPrompt')
+      .addSeparator()
+      .addItem('Лист лидов по активному менеджеру', 'createOwnerSheetFromActiveRow')
+      .addItem('Обновить текущий лист менеджера', 'refreshCurrentOwnerSheet')
+      .addSeparator()
+      .addItem('Обновить подсветку задач (next_action_at)', 'applyNextActionFormattingAll')
+      .addToUi();
+
+  } catch(err){
+    console.log('onOpen error:', err);
+  }
+}
+
+function createNeedsReviewView(){
+  const ss = SpreadsheetApp.getActive();
+
+  let view = ss.getSheetByName('Needs Review');
+  if (!view) {
+    view = ss.insertSheet('Needs Review');
+  }
+  view.clear();
+
+  const formula =
+    "=QUERY('Leads (Master)'!A:AM;" +
+    "\"select * where AL = TRUE\";" +
+    "1)";
+
+  view.getRange('A1').setFormula(formula);
+  view.setFrozenRows(1);
+}
+
+/**
+ * Обновляет флаг needs_review и review_reasons для одной строки
+ */
+function updateReviewFlagsForRow_(sheet, row, headers){
+  const H = Object.fromEntries(headers.map((h,i)=>[String(h).trim(), i+1]));
+
+  if (!H['needs_review'] || !H['review_reasons']) {
+    // нет колонок — выходим
+    return;
+  }
+
+  const reasons = [];
+
+  // ===== Телефон =====
+  if (H['phone_valid']) {
+    const valid = sheet.getRange(row, H['phone_valid']).getValue();
+    if (valid === false) {
+      reasons.push('phone_invalid');
+    }
+  }
+
+  // ===== Город =====
+  if (H['city_confidence']) {
+    const conf = Number(sheet.getRange(row, H['city_confidence']).getValue() || 0);
+    if (conf > 0 && conf < 0.59) {
+      reasons.push('city_low_confidence');
+    }
+  }
+
+  if (H['city_note']) {
+    const note = String(sheet.getRange(row, H['city_note']).getValue() || '').trim();
+    if (note === 'raw') {
+      reasons.push('city_raw');
+    }
+  }
+
+  // ===== Регион / гео =====
+  if (H['region_status']) {
+    const rs = String(sheet.getRange(row, H['region_status']).getValue() || '').trim();
+    if (rs === 'Needs review') {
+      reasons.push('region_needs_review');
+    }
+  }
+
+  if (H['geo_status']) {
+    const gs = String(sheet.getRange(row, H['geo_status']).getValue() || '').trim();
+    if (gs) {
+      reasons.push('geo_error');
+    }
+  }
+
+  // ===== Дубли =====
+  if (H['is_duplicate']) {
+    const dupVal = sheet.getRange(row, H['is_duplicate']).getValue();
+    const dupBool =
+      dupVal === true ||
+      dupVal === 1 ||
+      String(dupVal).toUpperCase() === 'TRUE';
+
+    if (dupBool) {
+      reasons.push('duplicate');
+    }
+  }
+
+  // ===== Вывод =====
+  const need = reasons.length > 0;
+
+  sheet.getRange(row, H['needs_review']).setValue(need);
+  sheet.getRange(row, H['review_reasons']).setValue(reasons.join(', '));
+}
+
+function createReportsSheet(){
+  const ss = SpreadsheetApp.getActive();
+  const masterName = 'Leads (Master)';
+  const master = ss.getSheetByName(masterName);
+  if (!master) throw new Error("Нет листа 'Leads (Master)'");
+
+  let sh = ss.getSheetByName('Reports');
+  if (!sh) {
+    sh = ss.insertSheet('Reports');
+  }
+  sh.clear();
+
+  // ===== Блок 1: Воронка по статусам (stage) =====
+  sh.getRange('A1').setValue('Воронка по статусам (stage)');
+
+  // AD = stage
+  const formulaFunnel =
+    "=QUERY('" + masterName + "'!AD:AD;" +
+    "\"select AD, count(AD) " +
+    " where AD is not null " +
+    " group by AD " +
+    " label AD 'Stage', count(AD) 'Количество'\";" +
+    "1)";
+  sh.getRange('A2').setFormula(formulaFunnel);
+
+  // ===== Блок 2: Лиды по владельцам и статусам (owner x stage) =====
+  sh.getRange('E1').setValue('Лиды по владельцам (owner) и статусам (stage)');
+
+  // AC = owner, AD = stage
+  const formulaOwnerStage =
+    "=QUERY('" + masterName + "'!AC:AD;" +
+    "\"select AC, AD, count(AD) " +
+    " where AD is not null " +
+    " group by AC, AD " +
+    " label AC 'Owner', AD 'Stage', count(AD) 'Количество'\";" +
+    "1)";
+  sh.getRange('E2').setFormula(formulaOwnerStage);
+
+  // ===== Блок 3: Лиды по регионам и статусам (region x stage) =====
+  sh.getRange('A10').setValue('Лиды по регионам (region) и статусам (stage)');
+
+  // V = region, AD = stage
+  const formulaRegionStage =
+    "=QUERY('" + masterName + "'!V:AD;" +
+    "\"select V, AD, count(AD) " +
+    " where AD is not null " +
+    " group by V, AD " +
+    " label V 'Region', AD 'Stage', count(AD) 'Количество'\";" +
+    "1)";
+  sh.getRange('A11').setFormula(formulaRegionStage);
+
+  // ===== Блок 4: Конверсия New → Won (по всей базе) =====
+  let stageNew = '';
+  let stageWon = '';
+  try {
+    stageNew = typeof getStageByCode_ === 'function' ? (getStageByCode_('new') || '') : '';
+    stageWon = typeof getStageByCode_ === 'function' ? (getStageByCode_('won') || '') : '';
+  } catch(e) {
+    stageNew = '';
+    stageWon = '';
+  }
+  if (!stageNew) stageNew = 'New';
+  if (!stageWon) stageWon = 'Won';
+
+  sh.getRange('A20').setValue('Конверсия по этапам (New → Won)');
+  sh.getRange('A21').setValue('Всего ' + stageNew);
+  sh.getRange('A22').setValue('Всего ' + stageWon);
+  sh.getRange('A23').setValue('Конверсия ' + stageWon + ' / ' + stageNew);
+
+  // AD = stage
+  const formulaNewCount =
+    "=COUNTIF('" + masterName + "'!AD:AD;\"" + stageNew + "\")";
+  const formulaWonCount =
+    "=COUNTIF('" + masterName + "'!AD:AD;\"" + stageWon + "\")";
+  const formulaConversion =
+    "=IF(B21=0;\"\";B22/B21)";
+
+  sh.getRange('B21').setFormula(formulaNewCount);
+  sh.getRange('B22').setFormula(formulaWonCount);
+  sh.getRange('B23').setFormula(formulaConversion);
+  sh.getRange('B23').setNumberFormat('0.0%');
+
+  // ===== Блок 5: Отчёт по менеджеру (owner) через I2 =====
+  sh.getRange('H1').setValue('Отчёт по менеджеру (owner)');
+  sh.getRange('H2').setValue('Owner:');
+  const ownerInputCell = sh.getRange('I2');
+  ownerInputCell.setValue('');
+
+  // A = lead_id, E = name, V = region,
+  // AC = owner, AD = stage, AF = next_action_at
+  const formulaManager =
+    "=IF($I$2=\"\";\"\";" +
+    "QUERY('" + masterName + "'!A:AF;" +
+    "\"select A, E, V, AD, AF " +
+    " where AC = '\"&$I$2&\"' " +
+    " order by AF\";" +
+    "1))";
+
+  sh.getRange('H3').setFormula(formulaManager);
+
+  // ===== Блок 6: Запланированные действия (общий список) =====
+  sh.getRange('A27').setValue('Запланированные действия (все, по дате)');
+
+  const formulaNextActions =
+    "=QUERY('" + masterName + "'!A:AF;" +
+    "\"select AC, AD, E, AF " +
+    " where AF is not null " +
+    " order by AF " +
+    " label AC 'Owner', AD 'Stage', E 'Name', AF 'Next action'\";" +
+    "1)";
+
+  sh.getRange('A28').setFormula(formulaNextActions);
+
+  sh.setFrozenRows(1);
+}
+
+/**
+ * Внутренняя функция: создать/обновить отчётный лист для конкретного owner
+ */
+function createReportsSheet(){
+  const ss = SpreadsheetApp.getActive();
+  const masterName = 'Leads (Master)';
+  const master = ss.getSheetByName(masterName);
+  if (!master) throw new Error("Нет листа 'Leads (Master)'");
+
+  let sh = ss.getSheetByName('Reports');
+  if (!sh) {
+    sh = ss.insertSheet('Reports');
+  }
+  sh.clear();
+
+  // ===== Блок 1: Воронка по статусам (stage) =====
+  sh.getRange('A1').setValue('Воронка по статусам (stage)');
+
+  // AD = stage
+  const formulaFunnel =
+    "=QUERY('" + masterName + "'!AD:AD;" +
+    "\"select AD, count(AD) " +
+    " where AD is not null " +
+    " group by AD " +
+    " label AD 'Stage', count(AD) 'Количество'\";" +
+    "1)";
+  sh.getRange('A2').setFormula(formulaFunnel);
+
+  // ===== Блок 2: Лиды по владельцам и статусам (owner x stage) =====
+  sh.getRange('E1').setValue('Лиды по владельцам (owner) и статусам (stage)');
+
+  // AC = owner, AD = stage
+  const formulaOwnerStage =
+    "=QUERY('" + masterName + "'!AC:AD;" +
+    "\"select AC, AD, count(AD) " +
+    " where AD is not null " +
+    " group by AC, AD " +
+    " label AC 'Owner', AD 'Stage', count(AD) 'Количество'\";" +
+    "1)";
+  sh.getRange('E2').setFormula(formulaOwnerStage);
+
+  // ===== Блок 3: Лиды по регионам и статусам (region x stage) =====
+  sh.getRange('A10').setValue('Лиды по регионам (region) и статусам (stage)');
+
+  // V = region, AD = stage
+  const formulaRegionStage =
+    "=QUERY('" + masterName + "'!V:AD;" +
+    "\"select V, AD, count(AD) " +
+    " where AD is not null " +
+    " group by V, AD " +
+    " label V 'Region', AD 'Stage', count(AD) 'Количество'\";" +
+    "1)";
+  sh.getRange('A11').setFormula(formulaRegionStage);
+
+  // ===== Блок 4: Конверсия New → Won (по всей базе) =====
+  let stageNew = '';
+  let stageWon = '';
+  try {
+    stageNew = typeof getStageByCode_ === 'function' ? (getStageByCode_('new') || '') : '';
+    stageWon = typeof getStageByCode_ === 'function' ? (getStageByCode_('won') || '') : '';
+  } catch(e) {
+    stageNew = '';
+    stageWon = '';
+  }
+  if (!stageNew) stageNew = 'New';
+  if (!stageWon) stageWon = 'Won';
+
+  sh.getRange('A20').setValue('Конверсия по этапам (New → Won)');
+  sh.getRange('A21').setValue('Всего ' + stageNew);
+  sh.getRange('A22').setValue('Всего ' + stageWon);
+  sh.getRange('A23').setValue('Конверсия ' + stageWon + ' / ' + stageNew);
+
+  // AD = stage
+  const formulaNewCount =
+    "=COUNTIF('" + masterName + "'!AD:AD;\"" + stageNew + "\")";
+  const formulaWonCount =
+    "=COUNTIF('" + masterName + "'!AD:AD;\"" + stageWon + "\")";
+  const formulaConversion =
+    "=IF(B21=0;\"\";B22/B21)";
+
+  sh.getRange('B21').setFormula(formulaNewCount);
+  sh.getRange('B22').setFormula(formulaWonCount);
+  sh.getRange('B23').setFormula(formulaConversion);
+  sh.getRange('B23').setNumberFormat('0.0%');
+
+  // ===== Блок 5: Отчёт по менеджеру (owner) через I2 =====
+  sh.getRange('H1').setValue('Отчёт по менеджеру (owner)');
+  sh.getRange('H2').setValue('Owner:');
+  const ownerInputCell = sh.getRange('I2');
+  ownerInputCell.setValue('');
+
+  // A = lead_id, E = name, V = region,
+  // AC = owner, AD = stage, AF = next_action_at
+  const formulaManager =
+    "=IF($I$2=\"\";\"\";" +
+    "QUERY('" + masterName + "'!A:AF;" +
+    "\"select A, E, V, AD, AF " +
+    " where AC = '\"&$I$2&\"' " +
+    " order by AF\";" +
+    "1))";
+
+  sh.getRange('H3').setFormula(formulaManager);
+
+  // ===== Блок 6: Запланированные действия (общий список) =====
+  sh.getRange('A27').setValue('Запланированные действия (все, по дате)');
+
+  const formulaNextActions =
+    "=QUERY('" + masterName + "'!A:AF;" +
+    "\"select AC, AD, E, AF " +
+    " where AF is not null " +
+    " order by AF " +
+    " label AC 'Owner', AD 'Stage', E 'Name', AF 'Next action'\";" +
+    "1)";
+
+  sh.getRange('A28').setFormula(formulaNextActions);
+
+  sh.setFrozenRows(1);
+}
+
+function createManagerReportForOwner_(ownerName){
+  ownerName = String(ownerName || '').trim();
+  if (!ownerName){
+    SpreadsheetApp.getActive().toast('Не указано имя менеджера (owner)');
+    return;
+  }
+
+  const ss = SpreadsheetApp.getActive();
+  const masterName = 'Leads (Master)';
+  const master = ss.getSheetByName(masterName);
+  if (!master) throw new Error("Нет листа 'Leads (Master)'");
+
+  const safeOwner = ownerName.replace(/[\\/?*[\]]/g, '_');
+  let sheetName = 'Report - ' + safeOwner;
+  if (sheetName.length > 90){
+    sheetName = sheetName.slice(0, 90);
+  }
+
+  let sh = ss.getSheetByName(sheetName);
+  if (!sh){
+    sh = ss.insertSheet(sheetName);
+  }
+  sh.clear();
+
+  const ownerSql = ownerName.replace(/'/g, "''");
+
+  // Заголовок
+  sh.getRange('A1').setValue('Отчёт по менеджеру');
+  sh.getRange('A2').setValue('Owner:');
+  sh.getRange('B2').setValue(ownerName);
+
+  // Воронка этого owner по stage
+  sh.getRange('A4').setValue('Воронка по статусам (stage) для ' + ownerName);
+
+  // AC = owner, AD = stage
+  const formulaFunnel =
+    "=QUERY('" + masterName + "'!AC:AD;" +
+    "\"select AD, count(AD) " +
+    " where AC = '" + ownerSql + "' " +
+    "   and AD is not null " +
+    " group by AD " +
+    " label AD 'Stage', count(AD) 'Количество'\";" +
+    "1)";
+  sh.getRange('A5').setFormula(formulaFunnel);
+
+  // Конверсия New → Won для этого owner
+  let stageNew = '';
+  let stageWon = '';
+  try {
+    stageNew = typeof getStageByCode_ === 'function' ? (getStageByCode_('new') || '') : '';
+    stageWon = typeof getStageByCode_ === 'function' ? (getStageByCode_('won') || '') : '';
+  } catch(e) {
+    stageNew = '';
+    stageWon = '';
+  }
+  if (!stageNew) stageNew = 'New';
+  if (!stageWon) stageWon = 'Won';
+
+  sh.getRange('A11').setValue('Конверсия по этапам (New → Won) для ' + ownerName);
+  sh.getRange('A12').setValue('Всего ' + stageNew);
+  sh.getRange('A13').setValue('Всего ' + stageWon);
+  sh.getRange('A14').setValue('Конверсия ' + stageWon + ' / ' + stageNew);
+
+  // AC = owner, AD = stage
+  const formulaNewCount =
+    "=COUNTIFS('" + masterName + "'!AC:AC;\"" + ownerName + "\";" +
+                 "'" + masterName + "'!AD:AD;\"" + stageNew + "\")";
+
+  const formulaWonCount =
+    "=COUNTIFS('" + masterName + "'!AC:AC;\"" + ownerName + "\";" +
+                 "'" + masterName + "'!AD:AD;\"" + stageWon + "\")";
+
+  const formulaConv =
+    "=IF(B12=0;\"\";B13/B12)";
+
+  sh.getRange('B12').setFormula(formulaNewCount);
+  sh.getRange('B13').setFormula(formulaWonCount);
+  sh.getRange('B14').setFormula(formulaConv);
+  sh.getRange('B14').setNumberFormat('0.0%');
+
+  // Задачи этого owner
+  sh.getRange('A18').setValue('Задачи менеджера (запланированные действия)');
+
+  // A=lead_id, E=name, V=region, AC=owner, AD=stage, AF=next_action_at
+  const formulaTasks =
+    "=QUERY('" + masterName + "'!A:AF;" +
+    "\"select A, E, V, AD, AF " +
+    " where AC = '" + ownerSql + "' " +
+    "   and AF is not null " +
+    " order by AF " +
+    " label A 'Lead ID', E 'Name', V 'Region', AD 'Stage', AF 'Next action'\";" +
+    "1)";
+
+  sh.getRange('A19').setFormula(formulaTasks);
+
+  sh.setFrozenRows(1);
+}
+
+function createManagerReportFromActiveRow(){
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName('Leads (Master)');
+  if (!sh) throw new Error("Нет листа 'Leads (Master)'");
+
+  const row = sh.getActiveCell().getRow();
+  if (row === 1) {
+    SpreadsheetApp.getActive().toast('Выберите строку с лидом ниже шапки');
+    return;
+  }
+
+  const headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
+  const H = Object.fromEntries(headers.map((h,i)=>[String(h).trim(), i+1]));
+
+  if (!H['owner']) {
+    throw new Error("В шапке нет столбца 'owner'");
+  }
+
+  const ownerName = String(sh.getRange(row, H['owner']).getValue() || '').trim();
+  if (!ownerName) {
+    SpreadsheetApp.getActive().toast('В этой строке не указан owner');
+    return;
+  }
+
+  createManagerReportForOwner_(ownerName);
+}
+
+
+
+function getLogsSheet_() {
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName('Logs');
+  if (!sh) {
+    sh = ss.insertSheet('Logs');
+    sh.getRange(1, 1, 1, 6).setValues([[
+      'timestamp',
+      'level',
+      'where',
+      'message',
+      'row',
+      'details_json'
+    ]]);
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
+
+function logError_(where, err, details) {
+  try {
+    const sh = getLogsSheet_();
+    const row = sh.getLastRow() + 1;
+    const msg = err && err.message ? String(err.message) : String(err);
+    const det = details ? JSON.stringify(details) : '';
+    sh.getRange(row, 1, 1, 6).setValues([[
+      new Date(),
+      'ERROR',
+      where,
+      msg,
+      details && details.row ? details.row : '',
+      det
+    ]]);
+  } catch(e) {
+    // в крайнем случае просто в консоль
+    console.log('logError_ failed: ' + e);
+  }
+}
+
+function logInfo_(where, message, details) {
+  try {
+    const sh = getLogsSheet_();
+    const row = sh.getLastRow() + 1;
+    const det = details ? JSON.stringify(details) : '';
+    sh.getRange(row, 1, 1, 6).setValues([[
+      new Date(),
+      'INFO',
+      where,
+      message || '',
+      details && details.row ? details.row : '',
+      det
+    ]]);
+  } catch(e) {
+    console.log('logInfo_ failed: ' + e);
+  }
+}
+
+
+
+function protectTechSheets(){
+  const ss = SpreadsheetApp.getActive();
+  const techSheetNames = [
+    'StatusList',
+    'Owners',
+    'Cities_Cache',
+    'Logs',
+    'Reports',
+    'Needs Review'
+  ];
+
+  techSheetNames.forEach(name => {
+    const sh = ss.getSheetByName(name);
+    if (!sh) return;
+
+    // Удаляем старые sheet-протекции
+    const protections = sh.getProtections(SpreadsheetApp.ProtectionType.SHEET);
+    protections.forEach(p => p.remove());
+
+    const prot = sh.protect().setDescription('5Yes: tech sheet ' + name);
+
+    try {
+      prot.removeEditors(prot.getEditors());
+    } catch(e) {}
+    if (prot.canDomainEdit()){
+      prot.setDomainEdit(false);
+    }
+  });
+
+  SpreadsheetApp.getActive().toast('Технические листы защищены');
+}
+
+function applyAllProtections(){
+  protectLeadsMaster();
+  protectTechSheets();
+}
+
+
+/**
+ * Защита листа "Leads (Master)".
+ * Разрешаем редактировать только нужные колонки менеджерам.
+ */
+function protectLeadsMaster(){
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName('Leads (Master)');
+  if (!sh) throw new Error('Нет листа "Leads (Master)"');
+
+  const lastRow = sh.getMaxRows();
+  const headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
+  const H = Object.fromEntries(headers.map((h,i)=>[String(h).trim(), i+1]));
+
+  // 1. Удаляем старые sheet-протекции на этом листе
+  const protections = sh.getProtections(SpreadsheetApp.ProtectionType.SHEET);
+  protections.forEach(p => p.remove());
+
+  // 2. Создаём защиту листа
+  const protection = sh.protect().setDescription('5Yes: защита Leads (Master)');
+
+  try {
+    protection.removeEditors(protection.getEditors());
+  } catch(e) {}
+  if (protection.canDomainEdit()) {
+    protection.setDomainEdit(false);
+  }
+
+  // 3. Колонки, которые МОЖНО редактировать
+  const editableColsNames = [
+    'name',
+    'Название компании',
+    'company_name',      // на всякий случай, если переименуешь
+    'phone_raw',
+    'email',
+    'city_raw',
+    'category',
+    'interviewer',
+    'owner',
+    'stage',
+    'substatus',
+    'next_action_at',
+    'notes'
+  ];
+
+  const editableRanges = [];
+
+  editableColsNames.forEach(colName => {
+    const colIndex = H[colName];
+    if (colIndex){
+      const range = sh.getRange(2, colIndex, lastRow-1, 1); // со 2-й строки
+      editableRanges.push(range);
+    }
+  });
+
+  protection.setUnprotectedRanges(editableRanges);
+
+  SpreadsheetApp.getActive().toast('Защита Leads (Master) обновлена');
+}
+
+/**
+ * Защита тех-листов (их редактировать нельзя)
+ */
+function protectTechSheets(){
+  const ss = SpreadsheetApp.getActive();
+  const techSheetNames = [
+    'StatusList',
+    'Owners',
+    'Cities_Cache',
+    'Logs',
+    'Reports',
+    'Needs Review'
+  ];
+
+  techSheetNames.forEach(name => {
+    const sh = ss.getSheetByName(name);
+    if (!sh) return;
+
+    const protections = sh.getProtections(SpreadsheetApp.ProtectionType.SHEET);
+    protections.forEach(p => p.remove());
+
+    const prot = sh.protect().setDescription('5Yes: tech sheet ' + name);
+    try {
+      prot.removeEditors(prot.getEditors());
+    } catch(e) {}
+    if (prot.canDomainEdit()){
+      prot.setDomainEdit(false);
+    }
+  });
+
+  SpreadsheetApp.getActive().toast('Технические листы защищены');
+}
+
+/**
+ * Одна кнопка — применить все защиты
+ */
+function applyAllProtections(){
+  protectLeadsMaster();
+  protectTechSheets();
+}
+
+
+/**
+ * Снимает ВСЕ защиты со всех листов таблицы
+ * включая sheet-protection и range-protection
+ */
+function removeAllProtections(){
+  const ss = SpreadsheetApp.getActive();
+  const sheets = ss.getSheets();
+
+  sheets.forEach(sh => {
+    // Снимаем защиту листа
+    const sheetProtections = sh.getProtections(SpreadsheetApp.ProtectionType.SHEET);
+    sheetProtections.forEach(p => p.remove());
+
+    // Снимаем защиту диапазонов (если такие есть)
+    const rangeProtections = sh.getProtections(SpreadsheetApp.ProtectionType.RANGE);
+    rangeProtections.forEach(p => p.remove());
+  });
+
+  SpreadsheetApp.getActive().toast('Все защиты удалены ✔');
+}
